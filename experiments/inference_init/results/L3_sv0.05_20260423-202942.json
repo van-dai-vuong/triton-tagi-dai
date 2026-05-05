@@ -1,0 +1,49 @@
+{
+  "depth": 3,
+  "hidden": 256,
+  "sigma_v": 0.05,
+  "n_epochs": 1,
+  "batch_size": 512,
+  "seed": 42,
+  "sigma_m_vals": [
+    0.5
+  ],
+  "sigma_z_vals": [
+    0.5
+  ],
+  "he_baseline": {
+    "best_acc": 0.9501,
+    "final_acc": 0.9501,
+    "per_epoch_acc": [
+      0.9501
+    ],
+    "diverged": false
+  },
+  "ibi_runs": [
+    {
+      "sigma_m": 0.5,
+      "sigma_z": 0.5,
+      "best_acc": 0.9476,
+      "final_acc": 0.9476,
+      "per_epoch_acc": [
+        0.9476
+      ],
+      "diverged": false
+    }
+  ],
+  "grid_best_acc": [
+    [
+      0.9476
+    ]
+  ],
+  "grid_final_acc": [
+    [
+      0.9476
+    ]
+  ],
+  "grid_diverged": [
+    [
+      false
+    ]
+  ]
+}

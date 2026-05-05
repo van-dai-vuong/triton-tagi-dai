@@ -38,6 +38,7 @@ from .hrc_softmax import (
     labels_to_hrc,
     obs_to_class_probs,
 )
+from .inference_init import inference_init
 from .layers import (
     Add,
     AvgPool2D,
@@ -97,6 +98,7 @@ __all__ = [
     "init_weight_bias_linear",
     "init_weight_bias_conv2d",
     "init_weight_bias_norm",
+    "inference_init",
     # Hierarchical softmax
     "HierarchicalSoftmax",
     "class_to_obs",
