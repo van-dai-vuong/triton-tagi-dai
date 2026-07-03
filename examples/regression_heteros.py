@@ -4,12 +4,12 @@ Heteroscedastic 1-D Regression — triton-tagi example.
 Demonstrates TAGI-V: the network learns both the mean prediction and the
 input-dependent noise variance simultaneously.  The output layer has 2 neurons:
   - index 0 (even): mean prediction
-  - index 1 (odd):  noise variance prediction (passed through EvenSoftplus)
+  - index 1 (odd):  noise variance prediction (passed through EvenExp)
 
-Note: cuTAGI uses EvenExp for the variance head; triton-tagi uses EvenSoftplus.
-Both map to positive noise variance but the functional form differs, so
-numerical results will not be identical — only qualitatively the same
-(uncertainty bands correctly widening in noisy regions).
+This mirrors cuTAGI's heteroscedastic regression exactly: the variance head is
+the exponential activation (`SplitActivation(Exp())` in cuTAGI), and the output
+update is the AGVI heteros kernel — a 1:1 port of cuTAGI's
+`update_delta_z_cuda_heteros`. Results match cuTAGI within fp32 tolerance.
 
 Usage:
     python examples/regression_heteros.py
@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from triton_tagi import EvenSoftplus, Linear, ReLU, Sequential
+from triton_tagi import EvenExp, Linear, ReLU, Sequential
 from triton_tagi.checkpoint import RunDir
 
 
@@ -191,7 +191,7 @@ def evaluate(
         with torch.no_grad():
             mu_2k, S_2k = net.forward(xb)
 
-        # Even: mean prediction; Odd: noise variance (aleatoric, after EvenSoftplus)
+        # Even: mean prediction; Odd: noise variance (aleatoric, after EvenExp)
         mu_pred = mu_2k[:, 0:1].cpu().numpy()          # (B, 1)
         noise_var = mu_2k[:, 1:2].cpu().numpy()        # aleatoric σ²_v (predicted)
         epist_var = S_2k[:, 0:1].cpu().numpy()         # epistemic σ²_ep
@@ -294,7 +294,7 @@ def main(
     x_tr, y_tr, x_te, y_te, stats = normalise(x_tr_raw, y_tr_raw, x_te_raw, y_te_raw)
     x_mean, x_std, y_mean, y_std = stats
     print(f"  Train: {len(x_tr)}  |  Test: {len(x_te)}")
-    print("  Note: EvenSoftplus used instead of cuTAGI's EvenExp — results differ slightly.")
+    print("  Note: EvenExp variance head + AGVI heteros update — matches cuTAGI (fp32).")
 
     # ── Config ──
     config: dict = {
@@ -311,7 +311,7 @@ def main(
         "seed": seed,
         "device": device,
         "triton_tagi_version": "0.1.0",
-        "note": "EvenSoftplus variance head (cuTAGI uses EvenExp)",
+        "note": "EvenExp variance head + AGVI heteros update (matches cuTAGI)",
     }
 
     # ── RunDir ──
@@ -321,7 +321,8 @@ def main(
 
     # ── Network ──
     # Output has 2 neurons: [mean_prediction, noise_variance_prediction]
-    # EvenSoftplus applies softplus to index 1 (noise variance) → always positive
+    # EvenExp applies exp to index 1 (noise variance) → always positive.
+    # Mirrors cuTAGI's `SplitActivation(Exp())` (examples/regression_heteros.py).
     net = Sequential(
         [
             Linear(1, hidden, device=dev, gain_w=gain_w, gain_b=gain_b),
@@ -329,7 +330,7 @@ def main(
             Linear(hidden, hidden, device=dev, gain_w=gain_w, gain_b=gain_b),
             ReLU(),
             Linear(hidden, 2, device=dev, gain_w=gain_w, gain_b=gain_b),
-            EvenSoftplus(half_width=1),
+            EvenExp(half_width=1),
         ],
         device=dev,
     )

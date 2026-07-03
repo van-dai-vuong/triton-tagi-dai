@@ -56,53 +56,76 @@ def _output_innovation_kernel_heteros(
     n_elements,
     BLOCK: tl.constexpr,
 ):
+    """AGVI heteroscedastic output update — 1:1 port of cuTAGI's CUDA
+    ``update_delta_z_cuda_heteros`` (``src/output_updater_cuda.cu``).
+
+    The output layer is interleaved width ``2K``: column ``2i`` is the mean
+    prediction ``Z_i`` (identity activation, Jacobian = 1), column ``2i+1`` is
+    the post-:class:`~triton_tagi.layers.EvenExp` aleatoric variance ``V̄²_i``
+    (log-normal moments). Terminology follows cuTAGI: ``V ~ N(0, μ_V2)`` is the
+    error, ``V2 = V²``, ``V2_bar`` its expectation, ``V2_bar_tilde = exp(·)`` the
+    positive-domain activation output.
+
+    Because EvenExp's Jacobian equals its mean (``jcb = μ_a``), the smoother gain
+    that maps the V̄²-tilde posterior back to the pre-activation latent is
+    ``jv = μ_{V̄²} / Σ_{V̄²}`` — folded in HERE, exactly as cuTAGI does. The paired
+    ``EvenExp.backward`` is therefore an identity passthrough.
+
+    Note: cuTAGI's CUDA kernel updates the mean with the *epistemic* variance
+    (``var_a_col``) and the variance with the *total* variance (``var_sum``) —
+    the "overfit_mu" behavior. The CPU ``compute_delta_z_heteros`` instead uses
+    ``var_sum`` for both. We follow the CUDA path, which is what the cuTAGI
+    regression-heteros example (``cuda=True``) actually runs.
+    """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     valid = offs < n_elements
 
     y = tl.load(y_ptr + offs, mask=valid)
 
-    # Output layer has twice the size
+    # Interleaved 2K output: even = Z (mean), odd = V̄²_tilde (post-EvenExp).
     obs_col = offs * 2
 
-    # mean of the Gaussian distribution for the output
     mu_a_col = tl.load(ym_ptr + obs_col, mask=valid)
     var_a_col = tl.load(yS_ptr + obs_col, mask=valid)
 
-    # V2_bar_tilde
+    # V2_bar_tilde moments. For EvenExp, jcb = μ_a, so cov_V2_bar_tilde = μ.
     mu_v2_bar_tilde = tl.load(ym_ptr + obs_col + 1, mask=valid)
     var_v2_bar_tilde = tl.load(yS_ptr + obs_col + 1, mask=valid)
+    cov_v2_bar_tilde = mu_v2_bar_tilde
 
-    # Compute the prior predictive PDF for v2
+    # Prior predictive for V2 (Gaussian-moment chain).
     mu_v2 = mu_v2_bar_tilde
     var_v2 = 3.0 * var_v2_bar_tilde + 2.0 * mu_v2_bar_tilde * mu_v2_bar_tilde
     cov_y_v = mu_v2
 
-    # Variance of the output
+    # Total output variance: epistemic (var_a_col) + learned aleatoric (mu_v2).
     var_sum = var_a_col + mu_v2
 
-    # Compute updating quantities for the mean of the output
-    tmp = 1.0 / var_sum
+    # ── Z (even) update: jcb_col = 1 (identity). Mean uses epistemic variance,
+    #    variance uses total variance — cuTAGI's overfit_mu behavior. ──
     obs_diff = y - mu_a_col
-    delta_mu_col = tmp * obs_diff
-    delta_var_col = -tmp
+    tmp_mu = 1.0 / var_a_col
+    tmp_var = 1.0 / var_sum
+    z_ok = (var_a_col > 0.0) & (var_sum > 0.0)
+    delta_mu_col = tl.where(z_ok, tmp_mu * obs_diff, 0.0)
+    delta_var_col = tl.where(z_ok, -tmp_var, 0.0)
 
-    # Compute the posterior mean and variance for V
+    # ── V̄² (odd) AGVI update ──
     mu_v_post = cov_y_v / var_sum * obs_diff
     var_v_post = mu_v2 - cov_y_v / var_sum * cov_y_v
 
-    # Compute the posterior mean and variance for V2
     mu_v2_post = mu_v_post * mu_v_post + var_v_post
     var_v2_post = 2.0 * var_v_post * var_v_post + 4.0 * var_v_post * mu_v_post * mu_v_post
 
-    # Compute the posterior mean and variance for V2_bar_tilde
     tmp_ratio = var_v2_bar_tilde / var_v2
     mu_v2_bar_tilde_post = mu_v2_bar_tilde + tmp_ratio * (mu_v2_post - mu_v2)
     var_v2_bar_tilde_post = var_v2_bar_tilde + tmp_ratio * tmp_ratio * (var_v2_post - var_v2)
 
-    # Compute update for V2_bar
-    delta_mu_v2 = mu_v2_bar_tilde_post - mu_v2_bar_tilde
-    delta_var_v2 = var_v2_bar_tilde_post - var_v2_bar_tilde
+    # Fold the exp Jacobian (smoother gain) into the pre-activation delta.
+    jv = cov_v2_bar_tilde / var_v2_bar_tilde
+    delta_mu_v2 = jv * (mu_v2_bar_tilde_post - mu_v2_bar_tilde)
+    delta_var_v2 = jv * jv * (var_v2_bar_tilde_post - var_v2_bar_tilde)
 
     tl.store(dm_ptr + obs_col, delta_mu_col, mask=valid)
     tl.store(dS_ptr + obs_col, delta_var_col, mask=valid)
