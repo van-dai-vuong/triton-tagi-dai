@@ -18,6 +18,9 @@ Forward (cuTAGI parity — L. Alric, 2024):
 
 from __future__ import annotations
 
+from functools import lru_cache
+
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -159,6 +162,142 @@ def triton_remax(mu_z: Tensor, var_z: Tensor):
     return mu_a, var_a, J
 
 
+@lru_cache(maxsize=16)
+def _legendre_unit_interval(num_quad: int) -> tuple[np.ndarray, np.ndarray]:
+    x, w = np.polynomial.legendre.leggauss(num_quad)
+    return (0.5 * (x + 1.0), 0.5 * w)
+
+
+def _stable_cdf_scaled(
+    alpha: Tensor,
+    beta: Tensor,
+    mu: Tensor,
+    var: Tensor,
+    t: Tensor,
+) -> Tensor:
+    """Return exp(-mu*t + 0.5*var*t^2) * Phi(beta)."""
+    inv_sqrt2 = 0.7071067811865475
+    expo = -mu * t + 0.5 * var * t * t
+    log_q = expo + torch.special.log_ndtr(beta)
+    q_log = torch.exp(torch.clamp(log_q, min=-745.0, max=709.0))
+
+    erfcx_arg = torch.clamp(-beta * inv_sqrt2, min=0.0)
+    q_erfcx = 0.5 * torch.exp(-0.5 * alpha * alpha) * torch.special.erfcx(erfcx_arg)
+    return torch.where(beta < -10.0, q_erfcx, q_log)
+
+
+def laplace_remax(
+    mu_z: Tensor,
+    var_z: Tensor,
+    *,
+    num_quad: int = 48,
+    full_jacobian: bool = True,
+    cap_jacobian: bool = True,
+    eps: float = 1e-8,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Laplace-Remax moments for independent Gaussian logits.
+
+    This path uses fixed quadrature over the Laplace identity for ``1 / S`` and
+    ``1 / S^2``. It is intended for small output dimensions such as CIFAR-10.
+    ``J[b, i, j]`` stores ``Cov(A_i, Z_j) / Var(Z_j)`` when
+    ``full_jacobian=True``; otherwise the diagonal is returned.
+    """
+    if num_quad < 2:
+        raise ValueError(f"num_quad must be >= 2, got {num_quad}")
+
+    squeeze = mu_z.dim() == 1
+    original_shape = mu_z.shape
+    if squeeze:
+        mu_z = mu_z.unsqueeze(0)
+        var_z = var_z.unsqueeze(0)
+    elif mu_z.dim() > 2:
+        mu_z = mu_z.reshape(-1, mu_z.shape[-1])
+        var_z = var_z.reshape(-1, var_z.shape[-1])
+
+    out_dtype = mu_z.dtype
+    device = mu_z.device
+    work_dtype = torch.float64
+    mu = mu_z.to(work_dtype)
+    var = var_z.clamp_min(eps).to(work_dtype)
+    B, K = mu.shape
+
+    u_np, w_np = _legendre_unit_interval(num_quad)
+    u = torch.as_tensor(u_np, dtype=work_dtype, device=device).view(1, num_quad, 1)
+    w = torch.as_tensor(w_np, dtype=work_dtype, device=device).view(1, num_quad, 1)
+    one_minus_u = (1.0 - u).clamp_min(eps)
+    t = u / one_minus_u
+    quad_w = w / (one_minus_u * one_minus_u)
+
+    mu_q = mu.unsqueeze(1)
+    var_q = var.unsqueeze(1)
+    sigma = torch.sqrt(var_q)
+    alpha = mu_q / sigma
+    beta = alpha - sigma * t
+
+    inv_sqrt_2pi = 0.3989422804014327
+    phi_alpha = inv_sqrt_2pi * torch.exp(-0.5 * alpha * alpha)
+    p0 = torch.special.ndtr(-alpha)
+    q = _stable_cdf_scaled(alpha, beta, mu_q, var_q, t)
+
+    L = (p0 + q).clamp_min(eps)
+    z_shift = mu_q - var_q * t
+    D = z_shift * q + sigma * phi_alpha
+    F = (z_shift * z_shift + var_q) * q + z_shift * sigma * phi_alpha
+    N = mu_q * p0 - sigma * phi_alpha
+    H = N + D
+
+    log_P = torch.sum(torch.log(L), dim=-1, keepdim=True)
+    P = torch.exp(log_P)
+    P_over_L = P / L
+
+    mu_a = torch.sum(quad_w * D * P_over_L, dim=1)
+    second_diag = torch.sum(quad_w * t * F * P_over_L, dim=1)
+
+    pi0 = torch.prod(p0.squeeze(1), dim=-1, keepdim=True)
+    mu_a = mu_a + pi0 / K
+    second_diag = second_diag + pi0 / (K * K)
+
+    R_D = D / L
+    R_H = H / L
+    EAZ = torch.einsum(
+        "bq,bqi,bqj->bij",
+        (quad_w.squeeze(-1) * P.squeeze(-1)),
+        R_D,
+        R_H,
+    )
+    diag_EAZ = torch.sum(quad_w * F * P_over_L, dim=1)
+    diag_idx = torch.arange(K, device=device)
+    EAZ[:, diag_idx, diag_idx] = diag_EAZ
+
+    p0_flat = p0.squeeze(1).clamp_min(torch.finfo(work_dtype).tiny)
+    product_except = torch.exp(
+        torch.sum(torch.log(p0_flat), dim=-1, keepdim=True) - torch.log(p0_flat)
+    )
+    EAZ = EAZ + (N.squeeze(1).unsqueeze(1) * product_except.unsqueeze(1)) / K
+
+    var_a = (second_diag - mu_a * mu_a).clamp_min(0.0)
+    cov_az = EAZ - mu_a.unsqueeze(2) * mu.unsqueeze(1)
+    if cap_jacobian:
+        bound = torch.sqrt(var_a.unsqueeze(2) * var.unsqueeze(1)).clamp_min(0.0)
+        cov_az = torch.clamp(cov_az, min=-bound, max=bound)
+    J_full = cov_az / var.unsqueeze(1).clamp_min(eps)
+    J = J_full if full_jacobian else torch.diagonal(J_full, dim1=1, dim2=2)
+
+    mu_a = mu_a.to(out_dtype).reshape(original_shape)
+    var_a = var_a.to(out_dtype).reshape(original_shape)
+    if full_jacobian:
+        if squeeze:
+            J = J.squeeze(0).to(out_dtype)
+        elif len(original_shape) > 2:
+            J = J.to(out_dtype).reshape(*original_shape[:-1], K, K)
+        else:
+            J = J.to(out_dtype)
+    else:
+        J = J.to(out_dtype).reshape(original_shape)
+
+    return mu_a, var_a, J
+
+
 # ======================================================================
 #  Remax Layer
 # ======================================================================
@@ -174,18 +313,57 @@ class Remax(Layer):
     Stores J from the forward pass for use during backward.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        approximation: str = "lognormal",
+        jacobian: str = "diag",
+        num_quad: int = 48,
+        cap_jacobian: bool = True,
+    ) -> None:
+        if approximation not in {"lognormal", "laplace"}:
+            raise ValueError(
+                f"approximation must be 'lognormal' or 'laplace', got {approximation!r}"
+            )
+        if jacobian not in {"diag", "full"}:
+            raise ValueError(f"jacobian must be 'diag' or 'full', got {jacobian!r}")
+        if approximation == "lognormal" and jacobian != "diag":
+            raise ValueError("lognormal Remax only exposes a diagonal Jacobian")
+        self.approximation = approximation
+        self.jacobian = jacobian
+        self.num_quad = num_quad
+        self.cap_jacobian = cap_jacobian
         self.J: Tensor | None = None  # stored Jacobian
 
     def forward(self, mz: Tensor, Sz: Tensor) -> tuple[Tensor, Tensor]:
-        mu_a, Sa, J = triton_remax(mz, Sz)
+        if self.approximation == "laplace":
+            mu_a, Sa, J = laplace_remax(
+                mz,
+                Sz,
+                num_quad=self.num_quad,
+                full_jacobian=self.jacobian == "full",
+                cap_jacobian=self.cap_jacobian,
+            )
+        else:
+            mu_a, Sa, J = triton_remax(mz, Sz)
         self.J = J
         return mu_a, Sa
 
     def backward(self, delta_ma: Tensor, delta_Sa: Tensor) -> tuple[Tensor, Tensor]:
         """Propagate deltas through a_k ≈ μ_a_k + J_k · (z_k − μ_z_k)."""
         J = self.J
+        if J is None:
+            raise RuntimeError("Remax.backward called before forward")
+        if J.dim() == delta_ma.dim() + 1:
+            return (
+                torch.einsum("...i,...ij->...j", delta_ma, J),
+                torch.einsum("...i,...ij->...j", delta_Sa, J * J),
+            )
         return delta_ma * J, delta_Sa * J * J
 
     def __repr__(self) -> str:
-        return "Remax()"
+        if self.approximation == "lognormal":
+            return "Remax()"
+        return (
+            "Remax(approximation='laplace', "
+            f"jacobian='{self.jacobian}', num_quad={self.num_quad})"
+        )
