@@ -54,7 +54,7 @@ def xavier_init(fan_in: float, fan_out: float) -> float:
 # ======================================================================
 
 
-def gaussian_param_init(scale: float, gain: float, shape, device="cuda"):
+def gaussian_param_init(scale: float, gain: float, shape, device="cpu"):
     """Initialize TAGI parameters with Gaussian mean and constant variance.
 
     Matches cuTAGI's ``gaussian_param_init``:
@@ -90,7 +90,7 @@ def init_weight_bias_linear(
     gain_w: float = 1.0,
     gain_b: float = 1.0,
     bias: bool = True,
-    device="cuda",
+    device="cpu",
 ):
     """Initialize weights and biases for a Linear (fully-connected) layer.
 
@@ -133,7 +133,7 @@ def init_weight_bias_conv2d(
     init_method: str = "He",
     gain_w: float = 1.0,
     gain_b: float = 1.0,
-    device="cuda",
+    device="cpu",
 ):
     """Initialize weights and biases for a Conv2D layer.
 
@@ -169,7 +169,7 @@ def init_weight_bias_conv2d(
 
 
 def init_weight_bias_norm(
-    num_features: int, gain_w: float = 1.0, gain_b: float = 1.0, device="cuda"
+    num_features: int, gain_w: float = 1.0, gain_b: float = 1.0, device="cpu"
 ):
     """Initialize parameters for a normalization layer (BatchNorm).
 

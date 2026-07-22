@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /Users/vuongdai/GitHub/triton-tagi && echo \"=== kernels dir ===\" && ls -la triton_tagi/kernels/ && echo \"=== layers dir ===\" && ls -la triton_tagi/layers/ && echo \"=== update dir ===\" && ls -la triton_tagi/update/ 2>/dev/null && echo \"=== grep triton imports ===\" && grep -rln \"import triton\\\\|from triton\\\\|triton\\\\.\" triton_tagi/ | sort)"
+    ]
+  }
+}

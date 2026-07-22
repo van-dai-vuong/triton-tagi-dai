@@ -117,7 +117,7 @@ class RunDir:
 def load_model(
     path: str | Path,
     build: Callable[[dict[str, Any]], Sequential],
-    device: str | torch.device = "cuda",
+    device: str | torch.device = "cpu",
 ) -> tuple[Sequential, dict[str, Any], int]:
     """Load a trained model from a checkpoint file.
 
@@ -142,7 +142,7 @@ def load_model(
                 Linear(cfg["in"], 128),
                 ReLU(),
                 Linear(128, cfg["out"]),
-                device="cuda",
+                device="cpu",
             )
 
         net, cfg, epoch = load_model("runs/.../checkpoints/epoch_0100.pt", build)

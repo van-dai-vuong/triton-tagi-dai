@@ -92,7 +92,7 @@ class MultiheadAttentionV2(LearnableLayer):
         init_method: str = "He",
         pos_emb: str = "",
         use_causal_mask: bool = False,
-        device: str = "cuda",
+        device: str = "cpu",
     ) -> None:
         if pos_emb != "":
             raise NotImplementedError(

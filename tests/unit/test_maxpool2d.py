@@ -13,7 +13,7 @@ import torch
 
 from triton_tagi.layers.maxpool2d import MaxPool2D
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _make_inputs(N, C, H, W, seed=0):

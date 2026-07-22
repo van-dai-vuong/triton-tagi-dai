@@ -14,12 +14,12 @@ Cap factor is a heuristic that regularises updates for larger batches:
 
 This is a general-purpose function — it works on any parameter tensor
 (weights, biases, or any future learnable parameters).
+
+Originally a fused Triton kernel; this is a pure-PyTorch port with identical
+math, running in-place on CPU (and CUDA/MPS if available).
 """
 
-import triton
-import triton.language as tl
-
-BLOCK = 1024
+import torch
 
 
 # ======================================================================
@@ -51,52 +51,6 @@ def get_cap_factor(batch_size: int) -> float:
 
 
 # ======================================================================
-#  Triton kernel — capped parameter update
-# ======================================================================
-
-
-@triton.jit
-def _capped_param_update_kernel(
-    m_ptr,
-    S_ptr,
-    dm_ptr,
-    dS_ptr,
-    cap_factor,
-    n_elements,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    valid = offs < n_elements
-
-    m = tl.load(m_ptr + offs, mask=valid)
-    S = tl.load(S_ptr + offs, mask=valid)
-    dm = tl.load(dm_ptr + offs, mask=valid)
-    dS = tl.load(dS_ptr + offs, mask=valid)
-
-    # Adaptive cap: delta_bar = sqrt(S) / cap_factor
-    delta_bar = tl.sqrt(tl.maximum(S, 1e-10)) / cap_factor
-
-    # ── Capped mean update ──
-    dm_sign = tl.where(dm > 0.0, 1.0, tl.where(dm < 0.0, -1.0, 0.0))
-    dm_capped = dm_sign * tl.minimum(tl.abs(dm), delta_bar)
-    m_new = m + dm_capped
-
-    # ── Capped variance update ──
-    # cuTAGI floors S at 1e-5 only when the update would make it non-positive
-    # (base_layer.cpp: `if (var_w[i] <= 0.0f) var_w[i] = 1E-5f`).
-    # An unconditional floor prevents S from shrinking below 1e-5 when it should
-    # reach ~1e-8, causing 7× larger mw updates than cuTAGI and training instability.
-    dS_sign = tl.where(dS > 0.0, 1.0, tl.where(dS < 0.0, -1.0, 0.0))
-    dS_capped = dS_sign * tl.minimum(tl.abs(dS), delta_bar)
-    S_raw = S + dS_capped
-    S_new = tl.where(S_raw <= 0.0, 1e-5, S_raw)
-
-    tl.store(m_ptr + offs, m_new, mask=valid)
-    tl.store(S_ptr + offs, S_new, mask=valid)
-
-
-# ======================================================================
 #  Python API
 # ======================================================================
 
@@ -116,13 +70,16 @@ def update_parameters(m, S, delta_m, delta_S, cap_factor):
     delta_S    : Tensor  variance deltas (Sw² * grad_S)
     cap_factor : float   regularisation strength
     """
-    n = m.numel()
-    _capped_param_update_kernel[(triton.cdiv(n, BLOCK),)](
-        m.view(-1),
-        S.view(-1),
-        delta_m.view(-1),
-        delta_S.view(-1),
-        cap_factor,
-        n,
-        BLOCK=BLOCK,
-    )
+    # Adaptive cap computed from the *current* variance, before any update.
+    delta_bar = torch.sqrt(S.clamp_min(1e-10)) / cap_factor
+
+    # ── Capped mean update ──
+    dm_capped = torch.sign(delta_m) * torch.minimum(delta_m.abs(), delta_bar)
+    m.add_(dm_capped)
+
+    # ── Capped variance update ──
+    # cuTAGI floors S at 1e-5 only when the update would make it non-positive
+    # (base_layer.cpp: `if (var_w[i] <= 0.0f) var_w[i] = 1E-5f`).
+    dS_capped = torch.sign(delta_S) * torch.minimum(delta_S.abs(), delta_bar)
+    S_raw = S + dS_capped
+    S.copy_(torch.where(S_raw <= 0.0, torch.full_like(S_raw, 1e-5), S_raw))

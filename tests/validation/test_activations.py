@@ -29,7 +29,7 @@ import torch
 
 from triton_tagi.layers.relu import ReLU as TReLU
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FWD_ATOL = 1e-5
 BWD_ATOL = 1e-5
 

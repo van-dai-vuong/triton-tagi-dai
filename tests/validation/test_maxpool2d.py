@@ -46,7 +46,7 @@ from triton_tagi.network import Sequential as TSequential
 
 pytestmark = pytest.mark.cuda
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 ATOL = 1e-4
 DATA_ROOT = "data"
 

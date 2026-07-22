@@ -21,77 +21,15 @@ Even indices pass through unchanged (identity).
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
 
 from ..base import Layer
 
-BLOCK = 1024
+EPS = 1e-9
 
 
 # ======================================================================
-#  Triton kernel — EvenSoftplus
-# ======================================================================
-
-
-@triton.jit
-def _even_softplus_kernel(
-    mz_ptr,
-    Sz_ptr,
-    ma_ptr,
-    Sa_ptr,
-    J_ptr,
-    n_elements,  # total number of elements (B * 2K)
-    half_width,  # K (number of observation dimensions)
-    BLOCK: tl.constexpr,
-):
-    """
-    Apply softplus to odd-indexed positions, identity to even-indexed.
-
-    Layout: for each batch item, positions are [mean_0, var_0, mean_1, var_1, ...]
-    Odd positions (1, 3, 5, ...) get softplus; even (0, 2, 4, ...) are identity.
-    """
-    EPS: tl.constexpr = 1e-9
-
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    valid = offs < n_elements
-
-    mz = tl.load(mz_ptr + offs, mask=valid, other=0.0)
-    Sz = tl.load(Sz_ptr + offs, mask=valid, other=0.0)
-
-    # Determine if this position is odd within each row
-    # Position within the row (2K wide): offs % (2 * half_width)
-    pos_in_row = offs % (2 * half_width)
-    is_odd = (pos_in_row % 2) == 1
-
-    # ── Softplus moments (for odd positions) ──
-    sig = tl.sigmoid(mz)
-    softplus_base = tl.where(mz > 20.0, mz, tl.log(1.0 + tl.exp(mz)))
-
-    # Second-order correction to the mean
-    mu_sp = softplus_base + 0.5 * Sz * sig * (1.0 - sig)
-    mu_sp = tl.maximum(mu_sp, EPS)
-
-    # Jacobian = sigmoid(mz)
-    J_sp = sig
-
-    # Variance: J² · S_z
-    Sa_sp = tl.maximum(J_sp * J_sp * Sz, EPS)
-
-    # ── Select: odd → softplus, even → identity ──
-    ma = tl.where(is_odd, mu_sp, mz)
-    Sa = tl.where(is_odd, Sa_sp, Sz)
-    J = tl.where(is_odd, J_sp, 1.0)
-
-    tl.store(ma_ptr + offs, ma, mask=valid)
-    tl.store(Sa_ptr + offs, Sa, mask=valid)
-    tl.store(J_ptr + offs, J, mask=valid)
-
-
-# ======================================================================
-#  Python wrapper
+#  Python API
 # ======================================================================
 
 
@@ -99,33 +37,41 @@ def even_softplus(mz, Sz, half_width):
     """
     Apply softplus to odd-indexed positions, identity to even-indexed.
 
+    Layout: for each batch item, positions are [mean_0, var_0, mean_1, var_1, ...]
+    Odd positions (1, 3, 5, ...) get softplus; even (0, 2, 4, ...) are identity.
+    Inputs are processed flat, so an element's parity is its flat-index parity.
+
     Parameters
     ----------
-    mz         : Tensor (B, 2K)  pre-activation means
-    Sz         : Tensor (B, 2K)  pre-activation variances
-    half_width : int             K = number of observation dimensions
+    mz         : Tensor (flat)  pre-activation means
+    Sz         : Tensor (flat)  pre-activation variances
+    half_width : int            K = number of observation dimensions (unused;
+                                kept for signature compatibility)
 
     Returns
     -------
-    ma : Tensor (B, 2K)  post-activation means
-    Sa : Tensor (B, 2K)  post-activation variances
-    J  : Tensor (B, 2K)  Jacobian (sigmoid for odd, 1.0 for even)
+    ma : Tensor  post-activation means
+    Sa : Tensor  post-activation variances
+    J  : Tensor  Jacobian (sigmoid for odd, 1.0 for even)
     """
-    n = mz.numel()
-    ma = torch.empty_like(mz)
-    Sa = torch.empty_like(Sz)
-    J = torch.empty_like(mz)
+    is_odd = (torch.arange(mz.numel(), device=mz.device) % 2) == 1
 
-    _even_softplus_kernel[(triton.cdiv(n, BLOCK),)](
-        mz,
-        Sz,
-        ma,
-        Sa,
-        J,
-        n,
-        half_width,
-        BLOCK=BLOCK,
-    )
+    # ── Softplus moments (for odd positions) ──
+    sig = torch.sigmoid(mz)
+    softplus_base = torch.where(mz > 20.0, mz, torch.log1p(torch.exp(mz)))
+
+    # Second-order correction to the mean
+    mu_sp = (softplus_base + 0.5 * Sz * sig * (1.0 - sig)).clamp_min(EPS)
+
+    # Jacobian = sigmoid(mz); variance = J² · S_z
+    J_sp = sig
+    Sa_sp = (J_sp * J_sp * Sz).clamp_min(EPS)
+
+    # ── Select: odd → softplus, even → identity ──
+    ma = torch.where(is_odd, mu_sp, mz)
+    Sa = torch.where(is_odd, Sa_sp, Sz)
+    J = torch.where(is_odd, J_sp, torch.ones_like(J_sp))
+
     return ma, Sa, J
 
 

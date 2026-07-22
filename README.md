@@ -1,10 +1,16 @@
 # triton-tagi
 
-**Tractable Approximate Gaussian Inference (TAGI) for Bayesian Neural Networks, in Python + Triton.**
+**Tractable Approximate Gaussian Inference (TAGI) for Bayesian Neural Networks, in pure PyTorch.**
 
-A minimal, GPU-accelerated reimplementation of [cuTAGI](https://github.com/lhnguyen102/cuTAGI)
-(C++/CUDA) with numerical parity on its headline examples and fused
-[Triton](https://triton-lang.org/) kernels for the hot paths.
+A minimal reimplementation of [cuTAGI](https://github.com/lhnguyen102/cuTAGI)
+(C++/CUDA) with numerical parity on its headline examples. It runs on **CPU**
+(including Apple Silicon Macs) out of the box, and on CUDA/MPS when available.
+
+> **Note.** This started as a [Triton](https://triton-lang.org/)-kernel port
+> and was subsequently rewritten to pure PyTorch tensor ops so it runs anywhere
+> PyTorch does — no Triton, no CUDA required. The math is unchanged; the hot
+> paths (fused variance / backward-delta matmuls, im2col via `unfold`/`fold`)
+> are expressed as vectorised `torch` operations.
 
 > **Idea.** TAGI treats every weight and activation as a Gaussian. The forward
 > pass propagates `(mean, variance)` analytically through each layer; the
@@ -18,7 +24,8 @@ A minimal, GPU-accelerated reimplementation of [cuTAGI](https://github.com/lhngu
 - **Library version:** 0.2.0 (scoped down 2026-04-19 to a minimal cuTAGI-parity core).
 - **Parity:** every kept example reproduces its cuTAGI counterpart at Phase-1
   tolerance; see [`PLAN.md`](PLAN.md) §3 for the table.
-- **Tests:** 95 unit + 89 validation pass on CUDA.
+- **Tests:** 101 unit tests pass on CPU; the validation suite (numerical parity
+  vs the `pytagi` reference) is marked `cuda` and runs on a GPU.
 - **Archive:** layers, optimizers, and diagnostics outside the minimal scope
   live under [`_archive/`](_archive/); nothing deleted.
 
@@ -43,12 +50,13 @@ A minimal, GPU-accelerated reimplementation of [cuTAGI](https://github.com/lhngu
 ```bash
 git clone https://github.com/miquelflorensa/triton-tagi.git
 cd triton-tagi
-pip install -e .           # core: torch, triton, numpy
+pip install -e .           # core: torch, numpy
 pip install -e ".[vis]"    # + matplotlib for figures
 pip install -e ".[dev]"    # + pytest, ruff
 ```
 
-Requires Python ≥ 3.10, PyTorch ≥ 2.0 with CUDA, and Triton ≥ 2.0.
+Requires Python ≥ 3.10 and PyTorch ≥ 2.0 (CPU build is fine). No CUDA or
+Triton dependency.
 
 ---
 
@@ -58,7 +66,7 @@ Requires Python ≥ 3.10, PyTorch ≥ 2.0 with CUDA, and Triton ≥ 2.0.
 import torch
 from triton_tagi import Linear, ReLU, Remax, Sequential
 
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 net = Sequential(
     [
         Linear(784, 256, device=device),
@@ -123,8 +131,9 @@ reading it top-to-bottom in an evening is a goal, not an accident.
 - `param_init.py`: He / Xavier / Gaussian init.
 - `hrc_softmax.py`: hierarchical softmax output for many-class classification.
 - `checkpoint.py`: `RunDir` (run-directory manager) and `load_model`.
-- `kernels/common.py`: fused Triton kernels for Linear / Conv2D / BN.
-- `kernels/attention.py`: fused Triton kernels for `MultiheadAttentionV2`
+- `kernels/common.py`: vectorised `torch` matmuls for Linear / Conv2D / BN
+  (fused variance forward + backward-delta).
+- `kernels/attention.py`: batched `torch` matmuls for `MultiheadAttentionV2`
   (`bmm_tagi_var` for the QKᵀ / Score@V variance, `bmm_shared_left/right`
   for the four backward reductions).
 - `update/observation.py`, `update/parameters.py`: innovation and parameter update rules.
@@ -164,7 +173,7 @@ $$\sigma^{2,\text{new}}_W = \max\!\left(\sigma^2_W + (\sigma^2_W)^2 \cdot \Delta
 Subclass `Layer` (pure moment propagation) or `LearnableLayer` (adds `update`
 and `num_parameters`), implement `forward` and `backward`, and you are done.
 No registry, no decorators. See [`examples/custom_layer.py`](examples/custom_layer.py)
-for an end-to-end ELU tutorial: Triton kernel, `Layer` subclass, MNIST run.
+for an end-to-end ELU tutorial: `Layer` subclass and MNIST run.
 
 ---
 
@@ -182,6 +191,10 @@ against a pytagi reference run on the same batch.
 ---
 
 ## Benchmarks
+
+> **Historical.** The numbers below are from the original Triton/GPU build and
+> are kept for reference; the pure-PyTorch port targets portability (CPU/Mac)
+> rather than peak GPU throughput.
 
 See [`benchmarks/results.md`](benchmarks/results.md). Summary on an RTX 4070
 Ti SUPER, median of 50 runs:
@@ -210,9 +223,9 @@ result at Phase-1 tolerance on a fixed seed. In particular:
 - **Remax** uses cuTAGI's MixtureReLU plus log-normal covariance path, not a
   Softplus+Taylor approximation. See `triton_tagi/layers/remax.py`.
 
-TF32 matmul is disabled at import time: cuTAGI uses scalar FMA with near-fp64
-accuracy, so leaving TF32 on would introduce systematic ~1e-3 variance errors
-and break parity.
+TF32 matmul is disabled at import time (a no-op on CPU-only builds): cuTAGI
+uses scalar FMA with near-fp64 accuracy, so leaving TF32 on when running on
+CUDA would introduce systematic ~1e-3 variance errors and break parity.
 
 ---
 

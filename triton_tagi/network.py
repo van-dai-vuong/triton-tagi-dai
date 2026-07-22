@@ -44,10 +44,10 @@ class Sequential:
     Parameters
     ----------
     layers : list of layer objects
-    device : str or torch.device  (default "cuda")
+    device : str or torch.device  (default "cpu")
     """
 
-    def __init__(self, layers: list, device: str = "cuda") -> None:
+    def __init__(self, layers: list, device: str = "cpu") -> None:
         self.device = torch.device(device)
         self.layers = layers
 

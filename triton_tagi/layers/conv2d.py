@@ -20,8 +20,7 @@ Backward:
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
+import torch.nn.functional as F
 from torch import Tensor
 
 from ..base import LearnableLayer
@@ -29,156 +28,40 @@ from ..kernels.common import triton_fused_backward_delta, triton_fused_var_forwa
 from ..param_init import init_weight_bias_conv2d
 from ..update.parameters import update_parameters
 
-BLOCK_EW = 1024
-
 
 # ======================================================================
-#  Triton kernel — im2col
-# ======================================================================
-
-
-@triton.jit
-def _im2col_kernel(
-    inp_ptr,
-    out_ptr,
-    N,
-    C,
-    H,
-    W,
-    kH,
-    kW,
-    stride,
-    padding,
-    H_out,
-    W_out,
-    K,  # K = C * kH * kW
-    BLOCK_K: tl.constexpr,
-):
-    """Each program = one patch row.  Writes K elements to out[pid, :]."""
-    pid = tl.program_id(0)  # 0 .. N*H_out*W_out - 1
-    n = pid // (H_out * W_out)
-    rem = pid % (H_out * W_out)
-    oh = rem // W_out
-    ow = rem % W_out
-
-    offs = tl.arange(0, BLOCK_K)
-    for k_start in range(0, K, BLOCK_K):
-        k = k_start + offs
-        valid = k < K
-        c = k // (kH * kW)
-        rem_k = k % (kH * kW)
-        kh = rem_k // kW
-        kw_v = rem_k % kW
-        ih = oh * stride - padding + kh
-        iw = ow * stride - padding + kw_v
-        ok = valid & (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W)
-        idx = n * (C * H * W) + c * (H * W) + ih * W + iw
-        val = tl.load(inp_ptr + idx, mask=ok, other=0.0)
-        tl.store(out_ptr + pid * K + k, val, mask=valid)
-
-
-# ======================================================================
-#  Triton kernel — col2im
-# ======================================================================
-
-
-@triton.jit
-def _col2im_kernel(
-    col_ptr,
-    img_ptr,
-    N,
-    C,
-    H,
-    W,
-    kH,
-    kW,
-    stride,
-    padding,
-    H_out,
-    W_out,
-    K,
-    total_pixels,
-    BLOCK: tl.constexpr,
-    KH_KW: tl.constexpr,  # = kH * kW  (constexpr for loop unroll)
-    KW: tl.constexpr,  # kW
-):
-    """Scatter-add columns back to image.  Each thread = one input pixel."""
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    valid = offs < total_pixels
-
-    n = offs // (C * H * W)
-    rem = offs % (C * H * W)
-    c = rem // (H * W)
-    rem2 = rem % (H * W)
-    h = rem2 // W
-    w = rem2 % W
-
-    acc = tl.zeros((BLOCK,), dtype=tl.float32)
-
-    for idx in tl.static_range(KH_KW):
-        kh = idx // KW
-        kw_v = idx % KW
-        oh_num = h + padding - kh
-        ow_num = w + padding - kw_v
-        oh = oh_num // stride
-        ow = ow_num // stride
-        ok = valid & (oh_num % stride == 0) & (oh >= 0) & (oh < H_out) & (ow >= 0) & (ow < W_out)
-        col_row = n * (H_out * W_out) + oh * W_out + ow
-        col_col = c * (kH * kW) + kh * KW + kw_v
-        val = tl.load(col_ptr + col_row * K + col_col, mask=ok, other=0.0)
-        acc += val
-
-    tl.store(img_ptr + offs, acc, mask=valid)
-
-
-# ======================================================================
-#  Python wrappers for im2col / col2im
+#  im2col / col2im (pure PyTorch, via F.unfold / F.fold)
+#
+#  F.unfold enumerates each sliding block as a column with channel-major then
+#  (kh, kw) ordering — exactly the K = c·(kH·kW) + kh·kW + kw layout, and blocks
+#  ordered row-major as oh·W_out + ow. F.fold is its exact scatter-add adjoint,
+#  matching the original col2im kernel.
 # ======================================================================
 
 
 def _triton_im2col(x, kH, kW, stride, padding):
-    """Unfold spatial input into patch matrix using Triton."""
-    N, C, H, W = x.shape
-    H_out = (H + 2 * padding - kH) // stride + 1
-    W_out = (W + 2 * padding - kW) // stride + 1
+    """Unfold spatial input into a patch matrix (N·L, K)."""
+    N = x.shape[0]
+    C = x.shape[1]
     K = C * kH * kW
-    L = H_out * W_out
-    out = torch.empty(N * L, K, device=x.device, dtype=x.dtype)
-    BLOCK_K = max(16, triton.next_power_of_2(min(K, 1024)))
-    _im2col_kernel[(N * L,)](
-        x, out, N, C, H, W, kH, kW, stride, padding, H_out, W_out, K, BLOCK_K=BLOCK_K
-    )
-    return out
+    # F.unfold -> (N, K, L); reorder to (N·L, K) with L = H_out·W_out.
+    cols = F.unfold(x, kernel_size=(kH, kW), stride=stride, padding=padding)
+    return cols.transpose(1, 2).reshape(N * cols.shape[2], K)
 
 
 def _triton_col2im(col, N, C, H, W, kH, kW, stride, padding):
-    """Fold patch matrix back into spatial layout using Triton."""
-    H_out = (H + 2 * padding - kH) // stride + 1
-    W_out = (W + 2 * padding - kW) // stride + 1
+    """Fold a patch matrix (N·L, K) back into spatial layout (N, C, H, W)."""
     K = C * kH * kW
-    total = N * C * H * W
-    img = torch.empty(N, C, H, W, device=col.device, dtype=col.dtype)
-    _col2im_kernel[(triton.cdiv(total, BLOCK_EW),)](
-        col,
-        img,
-        N,
-        C,
-        H,
-        W,
-        kH,
-        kW,
-        stride,
-        padding,
-        H_out,
-        W_out,
-        K,
-        total,
-        BLOCK=BLOCK_EW,
-        KH_KW=kH * kW,
-        KW=kW,
+    L = col.shape[0] // N
+    # (N·L, K) -> (N, K, L) then scatter-add back to the image.
+    cols = col.reshape(N, L, K).transpose(1, 2)
+    return F.fold(
+        cols,
+        output_size=(H, W),
+        kernel_size=(kH, kW),
+        stride=stride,
+        padding=padding,
     )
-    return img
 
 
 # ======================================================================
@@ -212,7 +95,7 @@ class Conv2D(LearnableLayer):
         stride: int = 1,
         padding: int = 0,
         padding_type: int = 1,
-        device: str = "cuda",
+        device: str = "cpu",
         init_method: str = "He",
         gain_w: float = 1.0,
         gain_b: float = 1.0,

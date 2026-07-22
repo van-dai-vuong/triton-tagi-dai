@@ -45,7 +45,7 @@ from triton_tagi.layers.linear import Linear as TLinear
 from triton_tagi.layers.relu import ReLU as TReLU
 from triton_tagi.network import Sequential as TSequential
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_ROOT = "data"
 
 pytestmark = pytest.mark.cuda

@@ -20,7 +20,7 @@ from triton_tagi.layers.layernorm import LayerNorm
 #  Helpers
 # ---------------------------------------------------------------------------
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _make_inputs(B: int, ni: int, seed: int = 0):

@@ -27,7 +27,7 @@ import torch
 
 from triton_tagi.layers.avgpool2d import AvgPool2D as TAvgPool2D
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 ATOL = 1e-5
 
 pytestmark = pytest.mark.cuda

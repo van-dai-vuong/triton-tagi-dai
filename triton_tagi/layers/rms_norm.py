@@ -56,7 +56,7 @@ class RMSNorm(LearnableLayer):
         normalized_shape,
         eps: float = 1e-6,
         gain_w: float = 1.0,
-        device: str = "cuda",
+        device: str = "cpu",
     ) -> None:
         if isinstance(normalized_shape, int):
             normalized_shape = [normalized_shape]

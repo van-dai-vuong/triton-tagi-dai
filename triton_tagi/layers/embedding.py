@@ -57,7 +57,7 @@ class Embedding(LearnableLayer):
         input_size: int = 0,
         scale: float = 1.0,
         padding_idx: int = -1,
-        device: str = "cuda",
+        device: str = "cpu",
     ) -> None:
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim

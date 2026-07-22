@@ -36,7 +36,7 @@ class PositionalEncoding(Layer):
         self,
         embed_dim: int,
         max_seq_len: int = 2048,
-        device: str = "cuda",
+        device: str = "cpu",
     ) -> None:
         self.embed_dim = embed_dim
         self.max_seq_len = max_seq_len

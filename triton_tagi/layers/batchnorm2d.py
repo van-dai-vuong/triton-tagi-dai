@@ -34,200 +34,18 @@ Backward pass:
         Δ_μ_β = S_β · Σ δ_μ_out
         Δ_S_β = S_β² · Σ δ_S_out
 
-All fused into Triton kernels for maximum GPU throughput.
+Pure-PyTorch implementation (runs on CPU / CUDA / MPS); all per-element work
+is vectorised with per-channel broadcasting.
 """
 
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
 
 from ..base import LearnableLayer
 from ..param_init import init_weight_bias_norm
 from ..update.parameters import update_parameters
-
-BLOCK = 1024
-
-
-# ======================================================================
-#  Triton kernel — forward pass
-# ======================================================================
-
-
-@triton.jit
-def _batchnorm_fwd_kernel(
-    # Input pointers
-    mz_ptr,
-    Sz_ptr,
-    # Running stats
-    run_m_ptr,
-    run_s_ptr,
-    # Parameters (gamma, beta)
-    mg_ptr,
-    Sg_ptr,
-    mb_ptr,
-    Sb_ptr,
-    # Output pointers
-    ma_ptr,
-    Sa_ptr,
-    # Normalised cache (for backward)
-    mhat_ptr,
-    Shat_ptr,
-    # Dimensions
-    N,
-    C,
-    HW,
-    eps,
-    BLOCK: tl.constexpr,
-):
-    """
-    Fused BN forward: normalise + affine for both mean and variance.
-    Each thread handles one element of the (N, C, H*W) tensor.
-    """
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    total = N * C * HW
-    valid = offs < total
-
-    # Determine channel index for each element
-    c = (offs // HW) % C
-
-    # Load inputs
-    mz = tl.load(mz_ptr + offs, mask=valid, other=0.0)
-    Sz = tl.load(Sz_ptr + offs, mask=valid, other=0.0)
-
-    # Load running stats (per-channel)
-    run_m = tl.load(run_m_ptr + c, mask=valid, other=0.0)
-    run_s = tl.load(run_s_ptr + c, mask=valid, other=0.0)
-
-    # Load parameters (per-channel)
-    mg = tl.load(mg_ptr + c, mask=valid, other=1.0)
-    Sg = tl.load(Sg_ptr + c, mask=valid, other=0.0)
-    mb = tl.load(mb_ptr + c, mask=valid, other=0.0)
-    Sb = tl.load(Sb_ptr + c, mask=valid, other=0.0)
-
-    # Normalise
-    inv_std = 1.0 / tl.sqrt(run_s + eps)
-    m_hat = (mz - run_m) * inv_std
-    S_hat = Sz / (run_s + eps)
-
-    # Affine transform (propagating Gaussian moments)
-    #   μ_out = μ_γ · μ_hat + μ_β
-    #   S_out = μ_γ² · S_hat + S_γ · μ_hat² + S_γ · S_hat + S_β
-    ma_out = mg * m_hat + mb
-    Sa_out = mg * mg * S_hat + Sg * m_hat * m_hat + Sg * S_hat + Sb
-
-    # Store outputs
-    tl.store(ma_ptr + offs, ma_out, mask=valid)
-    tl.store(Sa_ptr + offs, Sa_out, mask=valid)
-    tl.store(mhat_ptr + offs, m_hat, mask=valid)
-    tl.store(Shat_ptr + offs, S_hat, mask=valid)
-
-
-# ======================================================================
-#  Triton kernel — backward pass
-# ======================================================================
-
-
-@triton.jit
-def _batchnorm_bwd_kernel(
-    # Incoming deltas
-    dma_ptr,
-    dSa_ptr,
-    # Cached normalised values
-    mhat_ptr,
-    Shat_ptr,
-    # Running stats
-    run_s_ptr,
-    # Parameters (gamma)
-    mg_ptr,
-    # Output deltas (to propagate)
-    dmz_ptr,
-    dSz_ptr,
-    # Dimensions
-    N,
-    C,
-    HW,
-    eps,
-    BLOCK: tl.constexpr,
-):
-    """
-    BN backward: propagate deltas through affine + normalisation.
-    Each thread handles one element.
-    """
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    total = N * C * HW
-    valid = offs < total
-
-    c = (offs // HW) % C
-
-    # Load incoming deltas
-    dma = tl.load(dma_ptr + offs, mask=valid, other=0.0)
-    dSa = tl.load(dSa_ptr + offs, mask=valid, other=0.0)
-
-    # Load cached normalised values
-    # (not needed for delta propagation, but kept for consistency)
-
-    # Load gamma mean and running var
-    mg = tl.load(mg_ptr + c, mask=valid, other=1.0)
-    run_s = tl.load(run_s_ptr + c, mask=valid, other=1.0)
-
-    # Through affine:  δ_μ_hat = δ_μ_out · μ_γ
-    #                  δ_S_hat = δ_S_out · μ_γ²
-    d_mhat = dma * mg
-    d_Shat = dSa * mg * mg
-
-    # Through normalisation:  δ_μ_z = δ_μ_hat / √(S_run + ε)
-    #                         δ_S_z = δ_S_hat / (S_run + ε)
-    inv_std = 1.0 / tl.sqrt(run_s + eps)
-    inv_var = 1.0 / (run_s + eps)
-
-    dmz_out = d_mhat * inv_std
-    dSz_out = d_Shat * inv_var
-
-    tl.store(dmz_ptr + offs, dmz_out, mask=valid)
-    tl.store(dSz_ptr + offs, dSz_out, mask=valid)
-
-
-# ======================================================================
-#  Triton kernel — compute batch mean per channel (reduction)
-# ======================================================================
-
-
-@triton.jit
-def _channel_mean_kernel(
-    inp_ptr,
-    out_ptr,
-    N,
-    C,
-    HW,
-    inv_count,  # 1.0 / (N * HW)
-    BLOCK: tl.constexpr,
-):
-    """Compute per-channel mean: out[c] = mean over (N, HW) of inp[:, c, :]."""
-    c = tl.program_id(0)  # one program per channel
-    if c >= C:
-        return
-
-    acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    total = N * HW
-
-    for start in range(0, total, BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        valid = offs < total
-
-        n = offs // HW
-        hw = offs % HW
-        idx = n * C * HW + c * HW + hw
-
-        val = tl.load(inp_ptr + idx, mask=valid, other=0.0)
-        acc += val
-
-    result = tl.sum(acc, axis=0) * inv_count
-    tl.store(out_ptr + c, result)
 
 
 # ======================================================================
@@ -255,7 +73,7 @@ class BatchNorm2D(LearnableLayer):
         num_features: int,
         momentum: float = 0.1,
         eps: float = 1e-5,
-        device: str = "cuda",
+        device: str = "cpu",
         gain_w: float = 1.0,
         gain_b: float = 1.0,
         preserve_var: bool = True,
@@ -321,17 +139,11 @@ class BatchNorm2D(LearnableLayer):
         N, C, H, W = mz.shape
         HW = H * W
         n = N * HW
-        inv_count = 1.0 / n
 
-        BLOCK_RED = min(1024, triton.next_power_of_2(n))
-
-        batch_mean = torch.empty(C, device=mz.device, dtype=mz.dtype)
-        batch_var_s = torch.empty(C, device=mz.device, dtype=mz.dtype)
-        batch_mean_sq = torch.empty(C, device=mz.device, dtype=mz.dtype)
-
-        _channel_mean_kernel[(C,)](mz.contiguous(), batch_mean, N, C, HW, inv_count, BLOCK=BLOCK_RED)
-        _channel_mean_kernel[(C,)](Sz.contiguous(), batch_var_s, N, C, HW, inv_count, BLOCK=BLOCK_RED)
-        _channel_mean_kernel[(C,)]((mz * mz).contiguous(), batch_mean_sq, N, C, HW, inv_count, BLOCK=BLOCK_RED)
+        # Per-channel means over the (N, H, W) axes.
+        batch_mean = mz.reshape(N, C, HW).mean(dim=(0, 2))
+        batch_var_s = Sz.reshape(N, C, HW).mean(dim=(0, 2))
+        batch_mean_sq = (mz * mz).reshape(N, C, HW).mean(dim=(0, 2))
 
         # Current accumulators divide by n; rescale to (n − 1) for Bessel.
         bessel = n / (n - 1)
@@ -395,38 +207,29 @@ class BatchNorm2D(LearnableLayer):
             norm_var = self.running_var
         self._norm_var = norm_var
 
-        # Allocate outputs + cache
-        ma = torch.empty_like(mz)
-        Sa = torch.empty_like(Sz)
-        mhat = torch.empty_like(mz)
-        Shat = torch.empty_like(Sz)
+        # Per-channel stats/params broadcast over (N, C, H, W).
+        view = (1, C, 1, 1)
+        run_m = norm_mean.view(view)
+        run_s = norm_var.view(view)
+        mg = self.mw.view(view)
+        Sg = self.Sw.view(view)
+        mb = self.mb.view(view)
+        Sb = self.Sb.view(view)
 
-        total = N * C * HW
-        grid = (triton.cdiv(total, BLOCK),)
+        # Normalise
+        inv_std = 1.0 / torch.sqrt(run_s + self.eps)
+        m_hat = (mz - run_m) * inv_std
+        S_hat = Sz / (run_s + self.eps)
 
-        _batchnorm_fwd_kernel[grid](
-            mz.contiguous(),
-            Sz.contiguous(),
-            norm_mean,
-            norm_var,
-            self.mw,
-            self.Sw,
-            self.mb,
-            self.Sb,
-            ma,
-            Sa,
-            mhat,
-            Shat,
-            N,
-            C,
-            HW,
-            self.eps,
-            BLOCK=BLOCK,
-        )
+        # Affine transform (propagating Gaussian moments)
+        #   μ_out = μ_γ · μ_hat + μ_β
+        #   S_out = μ_γ² · S_hat + S_γ · μ_hat² + S_γ · S_hat + S_β
+        ma = mg * m_hat + mb
+        Sa = mg * mg * S_hat + Sg * m_hat * m_hat + Sg * S_hat + Sb
 
         # Cache for backward
-        self.m_hat = mhat
-        self.S_hat = Shat
+        self.m_hat = m_hat
+        self.S_hat = S_hat
 
         return ma, Sa
 
@@ -488,27 +291,16 @@ class BatchNorm2D(LearnableLayer):
         self.delta_Sb = (self.Sb**2) * grad_Sb
 
         # ── Propagate deltas to previous layer ──
-        delta_mz = torch.empty_like(delta_ma)
-        delta_Sz = torch.empty_like(delta_Sa)
+        # Through affine:  δμ_hat = μ_γ · δμ_out ;  δS_hat = μ_γ² · δS_out
+        # Through normalisation:  δμ_z = δμ_hat / √(S_run+ε) ;  δS_z = δS_hat / (S_run+ε)
+        view = (1, C, 1, 1)
+        mg = self.mw.view(view)
+        run_s = self._norm_var.view(view)
+        inv_std = 1.0 / torch.sqrt(run_s + self.eps)
+        inv_var = 1.0 / (run_s + self.eps)
 
-        total = N * C * HW
-        grid = (triton.cdiv(total, BLOCK),)
-
-        _batchnorm_bwd_kernel[grid](
-            delta_ma.contiguous(),
-            delta_Sa.contiguous(),
-            self.m_hat,
-            self.S_hat,
-            self._norm_var,
-            self.mw,
-            delta_mz,
-            delta_Sz,
-            N,
-            C,
-            HW,
-            self.eps,
-            BLOCK=BLOCK,
-        )
+        delta_mz = (delta_ma * mg) * inv_std
+        delta_Sz = (delta_Sa * mg * mg) * inv_var
 
         return delta_mz, delta_Sz
 

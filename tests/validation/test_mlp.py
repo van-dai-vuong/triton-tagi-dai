@@ -26,7 +26,7 @@ from triton_tagi.layers.linear import Linear as TLinear
 from triton_tagi.layers.relu import ReLU as TReLU
 from triton_tagi.network import Sequential as TSequential
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Tolerances after tf32 fix: tl.dot uses allow_tf32=False and torch.matmul
 # has tf32 disabled at import; triton now matches cuTAGI to ~1e-5 across layers.
 MEAN_ATOL = 1e-4  # MLP mean: ~8e-6 max after fix

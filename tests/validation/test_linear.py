@@ -26,7 +26,7 @@ from pytagi.nn import Sequential as PSequential
 
 from triton_tagi.layers.linear import Linear as TLinear
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Tolerances after tf32 fix: tl.dot uses allow_tf32=False and torch.matmul
 # has tf32 disabled at import time, so triton matches cuTAGI to fp32 precision.
 MEAN_ATOL = 1e-4  # mean forward: cuBLAS tile order vs scalar FMA → ~2e-6 max

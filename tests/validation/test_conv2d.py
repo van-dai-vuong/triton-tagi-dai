@@ -29,7 +29,7 @@ from pytagi.nn import Sequential as PSequential
 from triton_tagi.layers.conv2d import Conv2D as TConv2D
 from triton_tagi.network import Sequential as TSequential
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MEAN_ATOL = 1e-4
 VAR_ATOL = 1e-4
 UPDATE_ATOL = 1e-4

@@ -25,7 +25,7 @@ from triton_tagi.layers.batchnorm2d import BatchNorm2D as TBatchNorm2D
 from triton_tagi.layers.conv2d import Conv2D as TConv2D
 from triton_tagi.layers.linear import Linear as TLinear
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 pytestmark = pytest.mark.cuda
 

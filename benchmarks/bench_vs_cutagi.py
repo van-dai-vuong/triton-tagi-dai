@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZES = [1, 16, 32, 64, 256, 1024]
 WARMUP = 10
 REPS = 50

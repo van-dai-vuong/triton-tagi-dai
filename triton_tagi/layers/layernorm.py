@@ -67,7 +67,7 @@ class LayerNorm(LearnableLayer):
         normalized_shape: int,
         eps: float = 1e-5,
         bias: bool = True,
-        device: str = "cuda",
+        device: str = "cpu",
         gain_w: float = 1.0,
         gain_b: float = 1.0,
     ) -> None:

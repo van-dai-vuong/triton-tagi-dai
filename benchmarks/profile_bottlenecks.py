@@ -25,7 +25,7 @@ from pathlib import Path
 import torch
 import torch.profiler
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH = 256
 WARMUP = 10
 ACTIVE = 20  # steps captured by profiler

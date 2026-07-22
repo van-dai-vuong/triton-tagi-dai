@@ -41,8 +41,6 @@ Backward:
 
 from __future__ import annotations
 
-import triton
-import triton.language as tl
 from torch import Tensor
 
 from ..base import LearnableLayer
@@ -50,107 +48,26 @@ from .batchnorm2d import BatchNorm2D
 from .conv2d import Conv2D
 from .relu import ReLU
 
-BLOCK = 1024
-
 
 # ======================================================================
-#  Triton kernel — add_shortcut_mean_var (Forward)
+#  Shortcut / delta merge helpers (pure PyTorch, in-place)
 #
-#  Replicates cuTAGI's add_shortcut_mean_var_cuda:
-#      mu_a[i] += mu_s[i]
-#      var_a[i] += var_s[i]
-#
-#  In-place addition of the shortcut (or identity) moments to the
-#  main-path output.  Under the diagonal independence approximation
-#  the cross-covariance is zero, so variances simply add.
-# ======================================================================
-
-
-@triton.jit
-def _add_shortcut_mean_var_kernel(
-    mu_s_ptr,
-    var_s_ptr,
-    mu_a_ptr,
-    var_a_ptr,
-    n_elements,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    valid = offs < n_elements
-
-    mu_s = tl.load(mu_s_ptr + offs, mask=valid, other=0.0)
-    var_s = tl.load(var_s_ptr + offs, mask=valid, other=0.0)
-    mu_a = tl.load(mu_a_ptr + offs, mask=valid, other=0.0)
-    var_a = tl.load(var_a_ptr + offs, mask=valid, other=0.0)
-
-    mu_a += mu_s
-    var_a += var_s
-
-    tl.store(mu_a_ptr + offs, mu_a, mask=valid)
-    tl.store(var_a_ptr + offs, var_a, mask=valid)
-
-
-# ======================================================================
-#  Triton kernel — Delta Merge (Backward)
-#
-#  Replicates cuTAGI's add_shortcut_mean_var_cuda used for deltas:
-#      delta_mu_out[i]  += delta_mu_skip[i]
-#      delta_var_out[i] += delta_var_skip[i]
-#
-#  When deltas from the main and shortcut backward paths arrive at
-#  the same input, they are summed element-wise.
-# ======================================================================
-
-
-@triton.jit
-def _delta_merge_kernel(
-    # Deltas from skip/projection path (to add)
-    d_mu_skip_ptr,
-    d_var_skip_ptr,
-    # Deltas from main path (read-modify-write)
-    d_mu_out_ptr,
-    d_var_out_ptr,
-    n_elements,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    valid = offs < n_elements
-
-    d_mu_skip = tl.load(d_mu_skip_ptr + offs, mask=valid, other=0.0)
-    d_var_skip = tl.load(d_var_skip_ptr + offs, mask=valid, other=0.0)
-    d_mu_out = tl.load(d_mu_out_ptr + offs, mask=valid, other=0.0)
-    d_var_out = tl.load(d_var_out_ptr + offs, mask=valid, other=0.0)
-
-    d_mu_out += d_mu_skip
-    d_var_out += d_var_skip
-
-    tl.store(d_mu_out_ptr + offs, d_mu_out, mask=valid)
-    tl.store(d_var_out_ptr + offs, d_var_out, mask=valid)
-
-
-# ======================================================================
-#  Python wrappers
+#  Replicates cuTAGI's add_shortcut_mean_var_cuda: under the diagonal
+#  independence approximation the cross-covariance is zero, so the shortcut
+#  (or identity) moments simply add element-wise onto the main-path output.
+#  The same element-wise sum merges the main- and shortcut-path deltas in the
+#  backward pass.
 # ======================================================================
 
 
 def triton_add_shortcut(mu_s, var_s, mu_a, var_a):
     """
-    In-place addition: mu_a += mu_s, var_a += var_s  (Triton-accelerated).
+    In-place addition: mu_a += mu_s, var_a += var_s.
     Matches cuTAGI's add_shortcut_mean_var_cuda.
     """
     assert mu_s.shape == mu_a.shape, f"Shape mismatch: shortcut={mu_s.shape} vs output={mu_a.shape}"
-    n = mu_s.numel()
-    grid = (triton.cdiv(n, BLOCK),)
-    _add_shortcut_mean_var_kernel[grid](
-        mu_s.contiguous(),
-        var_s.contiguous(),
-        mu_a,
-        var_a,
-        n,
-        BLOCK=BLOCK,
-    )
+    mu_a.add_(mu_s)
+    var_a.add_(var_s)
     # mu_a, var_a modified in place
 
 
@@ -162,16 +79,8 @@ def triton_delta_merge(d_mu_skip, d_var_skip, d_mu_out, d_var_out):
     assert d_mu_skip.shape == d_mu_out.shape, (
         f"Shape mismatch: skip={d_mu_skip.shape} vs out={d_mu_out.shape}"
     )
-    n = d_mu_skip.numel()
-    grid = (triton.cdiv(n, BLOCK),)
-    _delta_merge_kernel[grid](
-        d_mu_skip.contiguous(),
-        d_var_skip.contiguous(),
-        d_mu_out,
-        d_var_out,
-        n,
-        BLOCK=BLOCK,
-    )
+    d_mu_out.add_(d_mu_skip)
+    d_var_out.add_(d_var_skip)
     # d_mu_out, d_var_out modified in place
 
 
@@ -248,7 +157,7 @@ class ResBlock(LearnableLayer):
     in_channels  : int
     out_channels : int
     stride       : int  (default 1)
-    device       : str  (default "cuda")
+    device       : str  (default "cpu")
     gain_w, gain_b : float  (default 1.0)
     """
 
@@ -257,7 +166,7 @@ class ResBlock(LearnableLayer):
         in_channels: int,
         out_channels: int,
         stride: int = 1,
-        device: str = "cuda",
+        device: str = "cpu",
         gain_w: float = 1.0,
         gain_b: float = 1.0,
     ) -> None:

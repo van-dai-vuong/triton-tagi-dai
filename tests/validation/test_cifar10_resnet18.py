@@ -63,7 +63,7 @@ from triton_tagi import (
 
 pytestmark = pytest.mark.cuda
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_ROOT = "data"
 N_CLASSES = 10
 HRC_LEN = 11

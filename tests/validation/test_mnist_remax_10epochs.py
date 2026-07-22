@@ -38,7 +38,7 @@ from triton_tagi.network import Sequential as TSequential
 
 pytestmark = pytest.mark.cuda
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_ROOT = "data"
 
 IN_F, H1, H2, OUT_F = 784, 256, 128, 10

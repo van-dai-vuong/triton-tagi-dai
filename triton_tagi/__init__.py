@@ -1,9 +1,10 @@
 """
-triton-tagi: Tractable Approximate Gaussian Inference on Triton
-================================================================
+triton-tagi: Tractable Approximate Gaussian Inference (PyTorch/CPU)
+==================================================================
 
-A minimal, GPU-accelerated Python reimplementation of cuTAGI
-(https://github.com/lhnguyen102/cuTAGI) using fused Triton kernels.
+A minimal Python reimplementation of cuTAGI
+(https://github.com/lhnguyen102/cuTAGI) in pure PyTorch. It runs on CPU
+(including Apple Silicon Macs) and, when available, on CUDA/MPS.
 
 The surface is deliberately small: the layer set mirrors what is needed to
 reproduce cuTAGI's headline examples (regression, MNIST MLP/CNN, CIFAR-10 CNN
@@ -15,19 +16,24 @@ Modules
 - ``layers``  : Bayesian layers
 - ``update``  : observation innovation and parameter update rules
 - ``network`` : ``Sequential`` network builder
-- ``kernels`` : low-level Triton kernels
+- ``kernels`` : low-level compute kernels (fused variance/backward matmuls)
 
 Numerical precision
 -------------------
-TF32 matmul is disabled at import time. cuTAGI uses scalar FMA loops
-(``__fmaf_rn``) with near-fp64 accuracy; leaving TF32 enabled in
-PyTorch/Triton would introduce systematic ~1e-3 errors in the variance
-forward pass and break numerical parity.
+TF32 matmul is disabled at import time (a no-op on CPU-only builds). cuTAGI
+uses scalar FMA loops with near-fp64 accuracy; leaving TF32 enabled on CUDA
+would introduce systematic ~1e-3 errors in the variance forward pass and
+break numerical parity.
 """
 
 import torch
 
-torch.backends.cuda.matmul.allow_tf32 = False
+# Disable TF32 so CUDA matmuls (if used) match cuTAGI's near-fp64 accuracy.
+# Harmless on CPU-only builds; guarded in case the backend is unavailable.
+try:
+    torch.backends.cuda.matmul.allow_tf32 = False
+except (AttributeError, RuntimeError):
+    pass
 
 from .base import Layer, LearnableLayer
 from .checkpoint import RunDir, load_model

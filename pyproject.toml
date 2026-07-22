@@ -5,11 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "triton-tagi"
 version = "0.2.0"
-description = "Bayesian neural networks via Tractable Approximate Gaussian Inference, implemented in Python/Triton"
+description = "Bayesian neural networks via Tractable Approximate Gaussian Inference, implemented in pure PyTorch (CPU/CUDA/MPS)"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
-    "triton>=2.0",
     "numpy>=1.24",
 ]
 

@@ -27,7 +27,7 @@ from triton_tagi.kernels.attention import (
     bmm_tagi_var,
 )
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WARMUP = 50
 REPS = 200
 

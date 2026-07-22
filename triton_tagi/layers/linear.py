@@ -46,7 +46,7 @@ class Linear(LearnableLayer):
         self,
         in_features: int,
         out_features: int,
-        device: str = "cuda",
+        device: str = "cpu",
         init_method: str = "He",
         gain_w: float = 1.0,
         gain_b: float = 1.0,

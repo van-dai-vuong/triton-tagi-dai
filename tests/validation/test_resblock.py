@@ -37,7 +37,7 @@ from triton_tagi.layers.resblock import ResBlock as TResBlock
 from triton_tagi.network import Sequential as TSequential
 from triton_tagi.update.parameters import get_cap_factor
 
-DEVICE = "cuda"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FWD_ATOL = 1e-5
 BWD_ATOL = 1e-5
 UPD_ATOL = 1e-6

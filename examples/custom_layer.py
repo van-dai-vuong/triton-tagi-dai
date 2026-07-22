@@ -29,8 +29,6 @@ that the ELU layer integrates correctly with Sequential and produces sensible
 accuracy.
 
 Usage:
-    cd /home/mf2/triton
-    source /home/mf2/.miniconda3/etc/profile.d/conda.sh && conda activate cuTAGI
     python examples/custom_layer.py
 """
 
@@ -39,101 +37,34 @@ from __future__ import annotations
 import math
 
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
 
 from triton_tagi.base import Layer
 
-BLOCK = 1024
-
 
 # ======================================================================
-#  Step 1 — Triton kernel
-#  Fuses forward + Jacobian computation in one pass.
+#  Step 1 — the moment-propagation math, in pure PyTorch
+#  Fuses forward + Jacobian computation in one vectorised pass.
 # ======================================================================
 
 
-@triton.jit
-def _elu_kernel(
-    mz_ptr,
-    Sz_ptr,
-    ma_ptr,
-    Sa_ptr,
-    J_ptr,
-    alpha,
-    N,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-
-    mz = tl.load(mz_ptr + offs, mask=mask)
-    Sz = tl.load(Sz_ptr + offs, mask=mask)
-
+def _elu_forward(mz: Tensor, Sz: Tensor, alpha: float):
     pos = mz > 0.0
 
     # Jacobian: 1 in the positive branch, α·e^μ_z in the negative branch
-    j_neg = alpha * tl.exp(mz)
-    J = tl.where(pos, 1.0, j_neg)
+    J = torch.where(pos, torch.ones_like(mz), alpha * torch.exp(mz))
 
     # Mean: μ_z in the positive branch, α(e^μ_z − 1) in the negative branch
-    ma = tl.where(pos, mz, alpha * (tl.exp(mz) - 1.0))
+    ma = torch.where(pos, mz, alpha * (torch.exp(mz) - 1.0))
 
-    # Variance: J² · S_z
-    Sa = J * J * Sz
-    Sa = tl.maximum(Sa, 0.0)  # guard against fp32 underflow
+    # Variance: J² · S_z (guard against fp32 underflow)
+    Sa = (J * J * Sz).clamp_min(0.0)
 
-    tl.store(ma_ptr + offs, ma, mask=mask)
-    tl.store(Sa_ptr + offs, Sa, mask=mask)
-    tl.store(J_ptr + offs, J, mask=mask)
-
-
-@triton.jit
-def _elu_backward_kernel(
-    J_ptr,
-    delta_ma_ptr,
-    delta_Sa_ptr,
-    out_dma_ptr,
-    out_dSa_ptr,
-    N,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-
-    J = tl.load(J_ptr + offs, mask=mask)
-    dma = tl.load(delta_ma_ptr + offs, mask=mask)
-    dSa = tl.load(delta_Sa_ptr + offs, mask=mask)
-
-    tl.store(out_dma_ptr + offs, J * dma, mask=mask)
-    tl.store(out_dSa_ptr + offs, J * J * dSa, mask=mask)
-
-
-# ======================================================================
-#  Step 2 — Python wrappers
-# ======================================================================
-
-
-def _triton_elu_forward(mz: Tensor, Sz: Tensor, alpha: float):
-    N = mz.numel()
-    ma = torch.empty_like(mz)
-    Sa = torch.empty_like(Sz)
-    J = torch.empty_like(mz)
-    grid = (triton.cdiv(N, BLOCK),)
-    _elu_kernel[grid](mz, Sz, ma, Sa, J, alpha, N, BLOCK=BLOCK)
     return ma, Sa, J
 
 
-def _triton_elu_backward(J: Tensor, delta_ma: Tensor, delta_Sa: Tensor):
-    N = J.numel()
-    out_dma = torch.empty_like(delta_ma)
-    out_dSa = torch.empty_like(delta_Sa)
-    grid = (triton.cdiv(N, BLOCK),)
-    _elu_backward_kernel[grid](J, delta_ma, delta_Sa, out_dma, out_dSa, N, BLOCK=BLOCK)
-    return out_dma, out_dSa
+def _elu_backward(J: Tensor, delta_ma: Tensor, delta_Sa: Tensor):
+    return J * delta_ma, J * J * delta_Sa
 
 
 # ======================================================================
@@ -177,7 +108,7 @@ class ELU(Layer):
         Sa_out : Tensor  post-activation variances
         """
         shape = ma.shape
-        ma_out, Sa_out, self._J = _triton_elu_forward(
+        ma_out, Sa_out, self._J = _elu_forward(
             ma.reshape(-1), Sa.reshape(-1), self.alpha
         )
         return ma_out.reshape(shape), Sa_out.reshape(shape)
@@ -200,7 +131,7 @@ class ELU(Layer):
         d_Sa : Tensor  variance deltas to propagate to the previous layer
         """
         shape = delta_ma.shape
-        d_ma, d_Sa = _triton_elu_backward(
+        d_ma, d_Sa = _elu_backward(
             self._J,
             delta_ma.reshape(-1),
             delta_Sa.reshape(-1),
