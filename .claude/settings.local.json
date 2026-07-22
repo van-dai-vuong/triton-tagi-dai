@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cd /Users/vuongdai/GitHub/triton-tagi && echo \"=== kernels dir ===\" && ls -la triton_tagi/kernels/ && echo \"=== layers dir ===\" && ls -la triton_tagi/layers/ && echo \"=== update dir ===\" && ls -la triton_tagi/update/ 2>/dev/null && echo \"=== grep triton imports ===\" && grep -rln \"import triton\\\\|from triton\\\\|triton\\\\.\" triton_tagi/ | sort)"
+      "Bash(cd /Users/vuongdai/GitHub/triton-tagi && echo \"=== kernels dir ===\" && ls -la triton_tagi/kernels/ && echo \"=== layers dir ===\" && ls -la triton_tagi/layers/ && echo \"=== update dir ===\" && ls -la triton_tagi/update/ 2>/dev/null && echo \"=== grep triton imports ===\" && grep -rln \"import triton\\\\|from triton\\\\|triton\\\\.\" triton_tagi/ | sort)",
+      "Bash(PYTHONPATH=. TAGI_RUNS_DIR=__TRACKED_VAR__/runs /tmp/tagi-venv/bin/python examples/regression_autocov.py --n_epochs 50)",
+      "Bash(PYTHONPATH=. TAGI_RUNS_DIR=__TRACKED_VAR__/runs /tmp/tagi-venv/bin/python examples/regression_autocov.py --n_epochs 1)",
+      "Bash(python -m py_compile examples/regression_autocov.py triton_tagi/autocov.py triton_tagi/param_init.py)",
+      "Bash(PYTHONPATH=. /tmp/tagi-venv/bin/python -m pytest tests/unit -q)",
+      "Bash(git check-ignore *)"
     ]
   }
 }

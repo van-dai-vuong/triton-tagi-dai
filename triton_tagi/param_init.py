@@ -54,7 +54,7 @@ def xavier_init(fan_in: float, fan_out: float) -> float:
 # ======================================================================
 
 
-def gaussian_param_init(scale: float, gain: float, shape, device="cpu"):
+def gaussian_param_init(scale: float, gain: float, shape, device="cpu", generator=None):
     """Initialize TAGI parameters with Gaussian mean and constant variance.
 
     Matches cuTAGI's ``gaussian_param_init``:
@@ -66,12 +66,13 @@ def gaussian_param_init(scale: float, gain: float, shape, device="cpu"):
         gain:  Multiplication factor for the variance.
         shape: Tensor shape (tuple or int).
         device: Torch device.
+        generator: Optional ``torch.Generator`` for reproducible sampling.
 
     Returns:
         m: Mean tensor.
         S: Variance tensor.
     """
-    m = torch.randn(shape, device=device) * scale
+    m = torch.randn(shape, device=device, generator=generator) * scale
     S = torch.full(
         shape if isinstance(shape, tuple) else (shape,), (gain * scale) ** 2, device=device
     )
@@ -91,6 +92,7 @@ def init_weight_bias_linear(
     gain_b: float = 1.0,
     bias: bool = True,
     device="cpu",
+    generator=None,
 ):
     """Initialize weights and biases for a Linear (fully-connected) layer.
 
@@ -104,6 +106,7 @@ def init_weight_bias_linear(
         gain_b: Gain multiplier for bias variance.
         bias:   Whether to create a bias.
         device: Torch device.
+        generator: Optional ``torch.Generator`` for reproducible sampling.
 
     Returns:
         mu_w, var_w, mu_b, var_b
@@ -115,10 +118,10 @@ def init_weight_bias_linear(
     else:
         raise ValueError(f"Unsupported init method: {init_method}")
 
-    mu_w, var_w = gaussian_param_init(scale, gain_w, (input_size, output_size), device)
+    mu_w, var_w = gaussian_param_init(scale, gain_w, (input_size, output_size), device, generator)
 
     if bias:
-        mu_b, var_b = gaussian_param_init(scale, gain_b, (1, output_size), device)
+        mu_b, var_b = gaussian_param_init(scale, gain_b, (1, output_size), device, generator)
     else:
         mu_b = torch.zeros(1, output_size, device=device)
         var_b = torch.zeros(1, output_size, device=device)
