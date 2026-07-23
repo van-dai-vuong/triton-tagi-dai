@@ -172,6 +172,13 @@ class GaussianTensor:
             f"var~{self.var.reshape(-1)[:3].tolist()})"
         )
 
+    # --- operator sugar: element-wise add / multiply build graph nodes ---
+    def __add__(self, other: "GaussianTensor") -> "GaussianTensor":
+        return add(self, other)
+
+    def __mul__(self, other: "GaussianTensor") -> "GaussianTensor":
+        return mul(self, other)
+
     def _accumulate(self, d_mu: Tensor, d_var: Tensor) -> None:
         if _TRACE:
             print(f"      OUT -> {self.name}._accumulate(d_mu={_fmt(d_mu)}, d_var={_fmt(d_var)})")
@@ -603,6 +610,32 @@ def remax(z: GaussianTensor) -> GaussianTensor:
     return Activation(triton_remax, "remax").forward(z)
 
 
+def _tanh_moments(mz, Sz):
+    """First-order (linearized) Gaussian moments of tanh."""
+    mu = torch.tanh(mz)
+    jcb = 1.0 - mu * mu                    # tanh'(z) = 1 - tanh(z)^2
+    var = (jcb * jcb * Sz).clamp_min(0.0)
+    return mu, var, jcb
+
+
+def _sigmoid_moments(mz, Sz):
+    """First-order (linearized) Gaussian moments of the logistic sigmoid."""
+    mu = torch.sigmoid(mz)
+    jcb = mu * (1.0 - mu)                  # sigmoid'(z) = s(z)(1 - s(z))
+    var = (jcb * jcb * Sz).clamp_min(0.0)
+    return mu, var, jcb
+
+
+def tanh(z: GaussianTensor) -> GaussianTensor:
+    """Bayesian tanh activation (first-order linearized moments)."""
+    return Activation(_tanh_moments, "tanh").forward(z)
+
+
+def sigmoid(z: GaussianTensor) -> GaussianTensor:
+    """Bayesian logistic-sigmoid activation (first-order linearized moments)."""
+    return Activation(_sigmoid_moments, "sigmoid").forward(z)
+
+
 class ReLU(Module):
     """Torch-style ReLU activation module (wraps :func:`relu`)."""
 
@@ -621,6 +654,26 @@ class Remax(Module):
 
     def __repr__(self):
         return "Remax()"
+
+
+class Tanh(Module):
+    """Torch-style tanh activation module (wraps :func:`tanh`)."""
+
+    def forward(self, z: GaussianTensor) -> GaussianTensor:
+        return tanh(z)
+
+    def __repr__(self):
+        return "Tanh()"
+
+
+class Sigmoid(Module):
+    """Torch-style sigmoid activation module (wraps :func:`sigmoid`)."""
+
+    def forward(self, z: GaussianTensor) -> GaussianTensor:
+        return sigmoid(z)
+
+    def __repr__(self):
+        return "Sigmoid()"
 
 
 # ----------------------------------------------------------------------
