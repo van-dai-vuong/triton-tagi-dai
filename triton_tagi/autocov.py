@@ -144,6 +144,7 @@ class GaussianTensor:
         self._retain = False
         self.post_mu: Tensor | None = None
         self.post_var: Tensor | None = None
+        self.topo: list[GaussianTensor] = []  # backward order (filled by build_topo)
 
     # ------------------------------------------------------------------ utils
     @property
@@ -206,10 +207,15 @@ class GaussianTensor:
         self._accumulate(delta_mu, delta_var)
         self.backward(cap_factor)
 
-    def backward(self, cap_factor: float = 1.0) -> None:
-        """Reverse-topological sweep: chain the layer backwards, apply capped
-        parameter updates. Innovations are freed afterwards (per-forward graph)."""
-        topo, seen = [], set()
+    def build_topo(self) -> list["GaussianTensor"]:
+        """Build the backward execution order (children before parents).
+
+        Same construction as PyTorch/micrograd autograd: a depth-first
+        post-order over the graph (parents before children), then reversed so
+        the sweep visits each node only after all of its children. The result
+        is cached on ``self.topo`` for inspection / :meth:`print_graph`.
+        """
+        post, seen = [], set()
 
         def dfs(node):
             if id(node) in seen:
@@ -217,10 +223,16 @@ class GaussianTensor:
             seen.add(id(node))
             for p in node.parents:
                 dfs(p)
-            topo.append(node)
+            post.append(node)  # post-order: parents before children
 
         dfs(self)
-        for node in reversed(topo):  # children before parents
+        self.topo = list(reversed(post))  # backward order: children before parents
+        return self.topo
+
+    def backward(self, cap_factor: float = 1.0) -> None:
+        """Reverse-topological sweep: chain the layer backwards, apply capped
+        parameter updates. Innovations are freed afterwards (per-forward graph)."""
+        for node in self.build_topo():  # children before parents
             has_innov = node.d_mu is not None
             if node._retain and not isinstance(node, Parameter):
                 # True posterior: hidden nodes carry NORMALIZED innovation, so
@@ -244,6 +256,64 @@ class GaussianTensor:
                     node.post_mu, node.post_var = node.mu, node.var
             # free innovations (graph is per-forward, like autograd)
             node.d_mu = node.d_var = None
+
+    # ==================================================================
+    #  Debugging: visualise the backward graph
+    # ==================================================================
+    def _kind(self) -> str:
+        """Short label for this node's role in the graph."""
+        if isinstance(self, Parameter):
+            return "Parameter"
+        if self._op is None:
+            return "input"
+        if isinstance(self._op, Activation):
+            return f"act:{self._op.name}"
+        return type(self._op).__name__  # Add / Mul / Linear
+
+    def render_graph(self, show_moments: bool = False) -> str:
+        """Return an ASCII tree of the graph rooted at this node.
+
+        Read **top → bottom = the backward direction**: the output (this node)
+        is the root, and its parents (the nodes it pushes innovations to) hang
+        below it, down to the :class:`Parameter` / ``input`` leaves. Nodes reached
+        by more than one path (e.g. a shared weight) are expanded once and later
+        shown as ``↩ (shared)``.
+        """
+        seen: set[int] = set()
+        lines: list[str] = []
+
+        def label(node: "GaussianTensor") -> str:
+            s = f"{node.name} [{node._kind()}] {tuple(node.shape)}"
+            if show_moments:
+                s += f"  mu~{_fmt(node.mu)} var~{_fmt(node.var)}"
+                if node.d_mu is not None:
+                    s += f"  dμ~{_fmt(node.d_mu)} dσ~{_fmt(node.d_var)}"
+            return s
+
+        def walk(node: "GaussianTensor", prefix: str, last: bool) -> None:
+            conn = "└─ " if last else "├─ "
+            dup = id(node) in seen
+            lines.append(prefix + conn + label(node) + ("  ↩ (shared)" if dup else ""))
+            if dup:
+                return
+            seen.add(id(node))
+            child_prefix = prefix + ("   " if last else "│  ")
+            kids = node.parents
+            for i, p in enumerate(kids):
+                walk(p, child_prefix, i == len(kids) - 1)
+
+        seen.add(id(self))
+        lines.append(label(self))
+        for i, p in enumerate(self.parents):
+            walk(p, "", i == len(self.parents) - 1)
+
+        n = len(self.build_topo())
+        header = f"backward graph — {n} nodes (top → bottom = backward flow)"
+        return header + "\n" + "─" * len(header) + "\n" + "\n".join(lines)
+
+    def print_graph(self, show_moments: bool = False) -> None:
+        """Print :meth:`render_graph` (handy in a debugger / notebook)."""
+        print(self.render_graph(show_moments=show_moments))
 
 
 class Parameter(GaussianTensor):

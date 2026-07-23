@@ -6,7 +6,9 @@
       "Bash(PYTHONPATH=. TAGI_RUNS_DIR=__TRACKED_VAR__/runs /tmp/tagi-venv/bin/python examples/regression_autocov.py --n_epochs 1)",
       "Bash(python -m py_compile examples/regression_autocov.py triton_tagi/autocov.py triton_tagi/param_init.py)",
       "Bash(PYTHONPATH=. /tmp/tagi-venv/bin/python -m pytest tests/unit -q)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(python -m py_compile triton_tagi/autocov.py)",
+      "Bash(PYTHONPATH=. /tmp/tagi-venv/bin/python __TRACKED_VAR__/test_autocov.py)"
     ]
   }
 }
