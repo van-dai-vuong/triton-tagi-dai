@@ -133,6 +133,7 @@ def main(save: str | None = None, show_moments: bool = False, compact: bool = Fa
 
     # ── Build the network ──
     net = ResNet18(device="cpu")
+    net.assign_names()  # hierarchical display names (b2a.conv1, ...); wiring unaffected
     print(f"ResNet18 (autocov) — parameters: {net.num_parameters:,}")
 
     # ── One dummy forward (batch of 1) to build the graph ──

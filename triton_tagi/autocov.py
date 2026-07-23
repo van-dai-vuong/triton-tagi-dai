@@ -444,6 +444,23 @@ class Module:
         for m in self.__dict__.get("_modules", {}).values():
             yield from m.modules()
 
+    def assign_names(self, prefix: str = "") -> "Module":
+        """Give every sub-module (and its ``W``/``b`` parameters) a hierarchical
+        display name from its attribute path — like torch's ``named_modules`` —
+        so the graph renders unambiguously (e.g. ``b2a.conv1`` instead of a bare
+        ``conv2d``). Purely cosmetic: it only sets ``.name`` labels and never
+        touches the graph wiring, which is by object identity. Call once after
+        constructing the network, before building the graph.
+        """
+        for attr, m in self.__dict__.get("_modules", {}).items():
+            m.name = f"{prefix}{attr}"
+            for pname in ("W", "b"):
+                p = getattr(m, pname, None)
+                if isinstance(p, Parameter):
+                    p.name = f"{m.name}.{pname}"
+            m.assign_names(prefix=f"{m.name}.")
+        return self
+
     @property
     def num_parameters(self) -> int:
         """Total learnable scalars (mean + variance for each parameter tensor)."""
