@@ -740,11 +740,18 @@ class Linear(Module):
 
     def backward(self, node: GaussianTensor) -> None:
         a = node.parents[0]
+        # Restore this node's cached input on the wrapped layer. The layer caches
+        # ma_in on the instance during forward; when the SAME Linear is reused in
+        # one graph (weight sharing / RNN unroll) that cache holds only the last
+        # forward, so we re-inject the correct per-node input from the graph edge.
+        self._layer.ma_in = a.mu.reshape(-1, self.in_features)
+        self._layer._input_shape = a.mu.shape
         # Reuse existing backward: returns input deltas, stores the param deltas.
         d_ma, d_Sa = self._layer.backward(node.d_mu, node.d_var)
         a._accumulate(d_ma, d_Sa)
         # Route the layer's stored parameter deltas onto the aliased Parameters;
         # the sweep then applies the capped update in place (layer tensors too).
+        # Reused instances accumulate across every use → backprop-through-time.
         self.W._accumulate(self._layer.delta_mw, self._layer.delta_Sw)
         if self.has_bias:
             self.b._accumulate(self._layer.delta_mb, self._layer.delta_Sb)
