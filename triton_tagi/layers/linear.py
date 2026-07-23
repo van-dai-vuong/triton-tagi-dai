@@ -51,6 +51,7 @@ class Linear(LearnableLayer):
         gain_w: float = 1.0,
         gain_b: float = 1.0,
         bias: bool = True,
+        generator=None,
     ) -> None:
         self.in_features = in_features
         self.out_features = out_features
@@ -66,6 +67,7 @@ class Linear(LearnableLayer):
             gain_b=gain_b,
             bias=bias,
             device=self.device,
+            generator=generator,
         )
 
         # Saved for backward

@@ -8,7 +8,9 @@
       "Bash(PYTHONPATH=. /tmp/tagi-venv/bin/python -m pytest tests/unit -q)",
       "Bash(git check-ignore *)",
       "Bash(python -m py_compile triton_tagi/autocov.py)",
-      "Bash(PYTHONPATH=. /tmp/tagi-venv/bin/python __TRACKED_VAR__/test_autocov.py)"
+      "Bash(PYTHONPATH=. /tmp/tagi-venv/bin/python __TRACKED_VAR__/test_autocov.py)",
+      "Bash(python -m py_compile triton_tagi/autocov.py triton_tagi/layers/linear.py)",
+      "Bash(PYTHONPATH=. /tmp/tagi-venv/bin/python __TRACKED_VAR__/test_linear_wrap.py)"
     ]
   }
 }

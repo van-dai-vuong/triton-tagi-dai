@@ -75,14 +75,14 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from .kernels.common import (
-    triton_fused_backward_delta,
-    triton_fused_var_forward,
-    triton_fused_weight_grad,
-)
+from .layers.avgpool2d import AvgPool2D as _AvgPool2DLayer
+from .layers.batchnorm2d import BatchNorm2D as _BatchNorm2DLayer
+from .layers.conv2d import Conv2D as _Conv2DLayer
+from .layers.flatten import Flatten as _FlattenLayer
+from .layers.linear import Linear as _LinearLayer
+from .layers.maxpool2d import MaxPool2D as _MaxPool2DLayer
 from .layers.relu import bayesian_relu
 from .layers.remax import triton_remax
-from .param_init import init_weight_bias_linear
 from .update.parameters import get_cap_factor, update_parameters
 
 _EPS = 1e-12  # floor for retained POSTERIOR variances (must stay > 0)
@@ -270,15 +270,23 @@ class GaussianTensor:
             return f"act:{self._op.name}"
         return type(self._op).__name__  # Add / Mul / Linear
 
-    def render_graph(self, show_moments: bool = False) -> str:
-        """Return an ASCII tree of the graph rooted at this node.
+    def render_graph(self, show_moments: bool = False, compact: bool = False) -> str:
+        """Return an ASCII rendering of the graph rooted at this node.
 
-        Read **top → bottom = the backward direction**: the output (this node)
-        is the root, and its parents (the nodes it pushes innovations to) hang
-        below it, down to the :class:`Parameter` / ``input`` leaves. Nodes reached
-        by more than one path (e.g. a shared weight) are expanded once and later
-        shown as ``↩ (shared)``.
+        ``compact=False`` (default) draws a nested tree read **top → bottom =
+        the backward direction**: the output (this node) is the root, and its
+        parents (the nodes it pushes innovations to) hang below it, down to the
+        :class:`Parameter` / ``input`` leaves. Nodes reached by more than one
+        path (e.g. a shared weight) are expanded once and later shown as
+        ``↩ (shared)``.
+
+        ``compact=True`` prints a flat numbered list in backward-execution order
+        (children before parents), each node referencing its parents by index —
+        far more readable for deep chains (e.g. ResNet) than the nested tree.
         """
+        if compact:
+            return self._render_compact(show_moments)
+
         seen: set[int] = set()
         lines: list[str] = []
 
@@ -311,9 +319,40 @@ class GaussianTensor:
         header = f"backward graph — {n} nodes (top → bottom = backward flow)"
         return header + "\n" + "─" * len(header) + "\n" + "\n".join(lines)
 
-    def print_graph(self, show_moments: bool = False) -> None:
+    def _render_compact(self, show_moments: bool) -> str:
+        """Flat numbered list in backward order; parents shown by index."""
+        topo = self.build_topo()
+        idx = {id(n): i for i, n in enumerate(topo)}
+
+        names = [n.name for n in topo]
+        kinds = [n._kind() for n in topo]
+        shapes = [str(tuple(n.shape)) for n in topo]
+        name_w = min(max((len(s) for s in names), default=4), 24)
+        kind_w = max((len(s) for s in kinds), default=4)
+        shape_w = min(max((len(s) for s in shapes), default=4), 18)
+        idx_w = len(str(len(topo) - 1))
+
+        lines = []
+        for i, node in enumerate(topo):
+            parents = ", ".join(f"#{idx[id(p)]}" for p in node.parents)
+            arrow = f"  ← {parents}" if parents else ""
+            s = (
+                f"[{i:>{idx_w}}] {names[i]:<{name_w}} "
+                f"{kinds[i]:<{kind_w}} {shapes[i]:<{shape_w}}"
+            )
+            if show_moments:
+                s += f"  mu~{_fmt(node.mu)} var~{_fmt(node.var)}"
+            lines.append(s + arrow)
+
+        header = (
+            f"backward graph — {len(topo)} nodes "
+            f"(compact; backward order, #child ← #parent)"
+        )
+        return header + "\n" + "─" * len(header) + "\n" + "\n".join(lines)
+
+    def print_graph(self, show_moments: bool = False, compact: bool = False) -> None:
         """Print :meth:`render_graph` (handy in a debugger / notebook)."""
-        print(self.render_graph(show_moments=show_moments))
+        print(self.render_graph(show_moments=show_moments, compact=compact))
 
 
 class Parameter(GaussianTensor):
@@ -568,20 +607,28 @@ class Remax(Module):
 
 
 # ----------------------------------------------------------------------
-#  Linear:  Z = a·W + b     (a, W, b Gaussian; W, b are Parameters)
-#        Forward moments and the three backward reductions all reuse the
-#        library kernels, so this matches triton_tagi.layers.Linear exactly.
+#  Linear:  reuses triton_tagi.layers.Linear forward + backward as-is.
 # ----------------------------------------------------------------------
 
 
 class Linear(Module):
-    """Bayesian fully-connected layer (Torch-style module).
+    """Bayesian fully-connected layer as an autocov operation.
 
-    Holds its Gaussian weight/bias as :class:`Parameter` leaves — auto-registered
-    by :class:`Module`, so ``net.parameters()`` finds them — and defines the op
-    :meth:`backward` the graph sweep calls. Forward moments and the three
-    backward reductions reuse the library kernels, matching
-    ``triton_tagi.layers.Linear`` exactly.
+    A thin wrapper that **reuses** :class:`triton_tagi.layers.Linear` — its
+    ``forward`` (matmul + fused variance kernel) and its ``backward`` (fused
+    backward-delta for the input plus the stored weight/bias deltas) are called
+    directly, so there is no duplicated linear math.
+
+    The layer's Gaussian weight/bias are exposed as autocov :class:`Parameter`
+    leaves that **alias the layer's own tensors** (same objects, no copy), so the
+    backward sweep applies the capped cuTAGI update in place and the wrapped layer
+    sees the updated weights on the next forward.
+
+    To set parameters after construction, mutate in place
+    (``lin.W.mu.copy_(...)``) so the alias is preserved. Like the underlying layer
+    (and autograd in general), the per-forward activation cache lives on the layer
+    instance, so call ``observe``/backward before reusing the same ``Linear``
+    instance elsewhere in the graph.
     """
 
     def __init__(
@@ -602,57 +649,248 @@ class Linear(Module):
         self.has_bias = bias
         self.name = name
 
-        mw, Sw, mb, Sb = init_weight_bias_linear(
-            in_features, out_features,
-            init_method=init_method, gain_w=gain_w, gain_b=gain_b,
-            bias=bias, device=device, generator=rng,
+        # Reuse the library layer for forward, backward, and initialisation.
+        self._layer = _LinearLayer(
+            in_features, out_features, device=device, init_method=init_method,
+            gain_w=gain_w, gain_b=gain_b, bias=bias, generator=rng,
         )
-        self.W = Parameter(mw, Sw, name=f"{name}.W")
-        # A learnable bias registers as a Parameter; otherwise keep a fixed,
-        # zero-variance deterministic bias (not registered / not updated).
+        # Expose (and alias) the layer's parameters so the sweep updates them.
+        self.W = Parameter(self._layer.mw, self._layer.Sw, name=f"{name}.W")
+        self.W.mu, self.W.var = self._layer.mw, self._layer.Sw  # guarantee aliasing
         if bias:
-            self.b = Parameter(mb, Sb, name=f"{name}.b")
+            self.b = Parameter(self._layer.mb, self._layer.Sb, name=f"{name}.b")
+            self.b.mu, self.b.var = self._layer.mb, self._layer.Sb
         else:
-            self.b = GaussianTensor(mb, Sb, name=f"{name}.b")
+            self.b = None
 
     def forward(self, a: GaussianTensor) -> GaussianTensor:
-        if a.shape[-1] != self.in_features:
-            raise ValueError(f"Linear expected last dim {self.in_features}, got {a.shape[-1]}")
-        lead = a.shape[:-1]
-        ma = a.mu.reshape(-1, self.in_features)
-        va = a.var.reshape(-1, self.in_features)
-
-        mu_z = (ma @ self.W.mu + self.b.mu).reshape(*lead, self.out_features)
-        Sz = triton_fused_var_forward(ma, va, self.W.mu, self.W.var, self.b.var)
-        var_z = Sz.reshape(*lead, self.out_features)
-
+        mz, Sz = self._layer.forward(a.mu, a.var)  # reuse existing forward
         parents = (a, self.W, self.b) if self.has_bias else (a, self.W)
-        return GaussianTensor(mu_z, var_z, parents=parents, op=self, name=self.name)
+        return GaussianTensor(mz, Sz, parents=parents, op=self, name=self.name)
 
     def backward(self, node: GaussianTensor) -> None:
-        a, W = node.parents[0], node.parents[1]
-        b = node.parents[2] if self.has_bias else None
-        out_f, in_f = self.out_features, self.in_features
-
-        # Output normalized innovation, flattened to 2D for the kernels.
-        dmu_z = node.d_mu.reshape(-1, out_f)
-        dvar_z = node.d_var.reshape(-1, out_f)
-
-        # ── Input a: same as triton_tagi.layers.Linear input-delta propagation ──
-        d_ma, d_Sa = triton_fused_backward_delta(dmu_z, dvar_z, W.mu)
-        a._accumulate(d_ma.reshape(a.mu.shape), d_Sa.reshape(a.var.shape))
-
-        # ── Weight W: Δμ_W = Sw·(a^T @ δμ_z),  ΔS_W = Sw^2·((a^2)^T @ δS_z) ──
-        ma = a.mu.reshape(-1, in_f)
-        grad_mw, grad_Sw = triton_fused_weight_grad(ma, dmu_z, dvar_z)
-        W._accumulate(W.var * grad_mw, (W.var * W.var) * grad_Sw)
-
-        # ── Bias b: Δμ_b = Sb·Σ δμ_z,  ΔS_b = Sb^2·Σ δS_z ──
+        a = node.parents[0]
+        # Reuse existing backward: returns input deltas, stores the param deltas.
+        d_ma, d_Sa = self._layer.backward(node.d_mu, node.d_var)
+        a._accumulate(d_ma, d_Sa)
+        # Route the layer's stored parameter deltas onto the aliased Parameters;
+        # the sweep then applies the capped update in place (layer tensors too).
+        self.W._accumulate(self._layer.delta_mw, self._layer.delta_Sw)
         if self.has_bias:
-            b._accumulate(
-                b.var * dmu_z.sum(0, keepdim=True),
-                (b.var * b.var) * dvar_z.sum(0, keepdim=True),
-            )
+            self.b._accumulate(self._layer.delta_mb, self._layer.delta_Sb)
 
     def __repr__(self):
         return f"Linear(in={self.in_features}, out={self.out_features}, bias={self.has_bias})"
+
+
+# ----------------------------------------------------------------------
+#  Conv2D:  reuses triton_tagi.layers.Conv2D forward + backward as-is.
+# ----------------------------------------------------------------------
+
+
+class Conv2D(Module):
+    """Bayesian 2-D convolution as an autocov operation.
+
+    A thin wrapper that **reuses** :class:`triton_tagi.layers.Conv2D` — its
+    ``forward`` (im2col + fused variance kernel) and its ``backward`` (fused
+    backward-delta for the input plus the stored weight/bias deltas) are called
+    directly, so there is no duplicated conv math.
+
+    The layer's Gaussian weight/bias are exposed as autocov :class:`Parameter`
+    leaves that **alias the layer's own tensors** (same objects, no copy). The
+    backward sweep therefore applies the capped cuTAGI update in place, and the
+    wrapped layer sees the updated weights on the next forward.
+
+    Note: like the underlying layer (and autograd in general), the per-forward
+    activation cache lives on the layer instance, so call ``observe``/backward
+    before reusing the same ``Conv2D`` instance again in the graph. Use separate
+    instances if you need two conv sites in one graph.
+    """
+
+    def __init__(
+        self,
+        C_in: int,
+        C_out: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        padding_type: int = 1,
+        device: str = "cpu",
+        init_method: str = "He",
+        gain_w: float = 1.0,
+        gain_b: float = 1.0,
+        name: str = "conv2d",
+    ) -> None:
+        super().__init__()
+        self.name = name
+        # Reuse the library layer for forward, backward, and initialisation.
+        self._layer = _Conv2DLayer(
+            C_in, C_out, kernel_size,
+            stride=stride, padding=padding, padding_type=padding_type,
+            device=device, init_method=init_method, gain_w=gain_w, gain_b=gain_b,
+        )
+        # Expose (and alias) the layer's parameters so the sweep updates them.
+        self.W = Parameter(self._layer.mw, self._layer.Sw, name=f"{name}.W")
+        self.b = Parameter(self._layer.mb, self._layer.Sb, name=f"{name}.b")
+        self.W.mu, self.W.var = self._layer.mw, self._layer.Sw  # guarantee aliasing
+        self.b.mu, self.b.var = self._layer.mb, self._layer.Sb
+
+    def forward(self, a: GaussianTensor) -> GaussianTensor:
+        mz, Sz = self._layer.forward(a.mu, a.var)  # reuse existing forward
+        return GaussianTensor(mz, Sz, parents=(a, self.W, self.b), op=self, name=self.name)
+
+    def backward(self, node: GaussianTensor) -> None:
+        a = node.parents[0]
+        # Reuse existing backward: returns input deltas, stores the param deltas.
+        d_ma, d_Sa = self._layer.backward(node.d_mu, node.d_var)
+        a._accumulate(d_ma, d_Sa)
+        # Route the layer's stored parameter deltas onto the aliased Parameters;
+        # the sweep then applies the capped update in place (layer tensors too).
+        self.W._accumulate(self._layer.delta_mw, self._layer.delta_Sw)
+        self.b._accumulate(self._layer.delta_mb, self._layer.delta_Sb)
+
+    def __repr__(self):
+        L = self._layer
+        return f"Conv2D({L.C_in}, {L.C_out}, kernel={L.kH}, stride={L.stride}, pad={L.padding})"
+
+
+# ----------------------------------------------------------------------
+#  BatchNorm2D:  reuses triton_tagi.layers.BatchNorm2D forward + backward.
+# ----------------------------------------------------------------------
+
+
+class BatchNorm2D(Module):
+    """Bayesian channel-wise BatchNorm2D as an autocov operation.
+
+    A thin wrapper that **reuses** :class:`triton_tagi.layers.BatchNorm2D` — its
+    ``forward`` (normalise with batch/running stats + Gaussian affine) and its
+    ``backward`` (un-normalise + stored γ/β deltas) are called directly.
+
+    The learnable scale ``γ`` and shift ``β`` are exposed as autocov
+    :class:`Parameter` leaves (``W`` and ``b``) that **alias the layer's tensors**,
+    so the backward sweep applies the capped update in place. Because BatchNorm's
+    data-dependent ``preserve_var`` init reassigns ``γ`` on the first forward, the
+    aliases are re-synced after every forward.
+
+    ``train()`` / ``eval()`` switch the wrapped layer between batch and running
+    statistics (and recurse like any :class:`Module`).
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        momentum: float = 0.1,
+        eps: float = 1e-5,
+        device: str = "cpu",
+        gain_w: float = 1.0,
+        gain_b: float = 1.0,
+        preserve_var: bool = True,
+        name: str = "batchnorm2d",
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self._layer = _BatchNorm2DLayer(
+            num_features, momentum=momentum, eps=eps, device=device,
+            gain_w=gain_w, gain_b=gain_b, preserve_var=preserve_var,
+        )
+        self.W = Parameter(self._layer.mw, self._layer.Sw, name=f"{name}.W")  # γ
+        self.b = Parameter(self._layer.mb, self._layer.Sb, name=f"{name}.b")  # β
+        self._sync_params()
+
+    def _sync_params(self) -> None:
+        """Re-point the Parameter aliases at the layer's live tensors (γ may be
+        reassigned by the layer's data-dependent ``preserve_var`` init)."""
+        self.W.mu, self.W.var = self._layer.mw, self._layer.Sw
+        self.b.mu, self.b.var = self._layer.mb, self._layer.Sb
+
+    def forward(self, a: GaussianTensor) -> GaussianTensor:
+        ma, Sa = self._layer.forward(a.mu, a.var)  # reuse existing forward
+        self._sync_params()  # keep aliases current after any γ reassignment
+        return GaussianTensor(ma, Sa, parents=(a, self.W, self.b), op=self, name=self.name)
+
+    def backward(self, node: GaussianTensor) -> None:
+        a = node.parents[0]
+        # Reuse existing backward: returns input deltas, stores γ/β deltas.
+        d_mz, d_Sz = self._layer.backward(node.d_mu, node.d_var)
+        a._accumulate(d_mz, d_Sz)
+        self.W._accumulate(self._layer.delta_mw, self._layer.delta_Sw)
+        self.b._accumulate(self._layer.delta_mb, self._layer.delta_Sb)
+
+    def train(self, mode: bool = True) -> "Module":
+        self._layer.train() if mode else self._layer.eval()
+        return super().train(mode)
+
+    def eval(self) -> "Module":
+        return self.train(False)
+
+    def __repr__(self):
+        L = self._layer
+        return f"BatchNorm2D(num_features={L.num_features}, momentum={L.momentum}, eps={L.eps})"
+
+
+# ----------------------------------------------------------------------
+#  Parameter-free ops: AvgPool2D / MaxPool2D / Flatten
+#
+#  Each wraps a single-input, single-output triton_tagi layer and reuses its
+#  forward + backward verbatim. No parameters, so the backward just routes the
+#  input-space delta onto the one parent.
+# ----------------------------------------------------------------------
+
+
+class _WrappedUnary(Module):
+    """Base for param-free autocov ops that wrap a one-in/one-out layer.
+
+    Subclasses set ``self.name`` and ``self._layer`` in ``__init__``. Because the
+    layer caches per-forward state (pooling indices, input shape), call
+    ``observe``/backward before reusing the same instance in the graph.
+    """
+
+    def forward(self, a: GaussianTensor) -> GaussianTensor:
+        ma, Sa = self._layer.forward(a.mu, a.var)  # reuse existing forward
+        return GaussianTensor(ma, Sa, parents=(a,), op=self, name=self.name)
+
+    def backward(self, node: GaussianTensor) -> None:
+        a = node.parents[0]
+        d_ma, d_Sa = self._layer.backward(node.d_mu, node.d_var)  # reuse existing backward
+        a._accumulate(d_ma, d_Sa)
+
+    def __repr__(self):
+        return repr(self._layer)
+
+
+class AvgPool2D(_WrappedUnary):
+    """Bayesian average pooling as an autocov op (wraps triton_tagi.layers.AvgPool2D)."""
+
+    def __init__(
+        self,
+        kernel_size: int,
+        spatial_correlation: bool = False,
+        name: str = "avgpool2d",
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self._layer = _AvgPool2DLayer(kernel_size, spatial_correlation=spatial_correlation)
+
+
+class MaxPool2D(_WrappedUnary):
+    """Bayesian max pooling as an autocov op (wraps triton_tagi.layers.MaxPool2D)."""
+
+    def __init__(
+        self,
+        kernel_size: int,
+        stride: int | None = None,
+        padding: int = 0,
+        name: str = "maxpool2d",
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self._layer = _MaxPool2DLayer(kernel_size, stride=stride, padding=padding)
+
+
+class Flatten(_WrappedUnary):
+    """Flatten spatial dims (N,C,H,W)→(N,C·H·W) as an autocov op."""
+
+    def __init__(self, name: str = "flatten") -> None:
+        super().__init__()
+        self.name = name
+        self._layer = _FlattenLayer()
