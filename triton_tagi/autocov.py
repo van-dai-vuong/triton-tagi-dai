@@ -573,6 +573,74 @@ def mul(x: GaussianTensor, y: GaussianTensor) -> GaussianTensor:
 
 
 # ----------------------------------------------------------------------
+#  Concat:  join two tensors along a dim (U-Net / DenseNet skip connections).
+#           Deterministic rearrangement (Jacobian = identity), so the backward
+#           just splits the innovation back to each input.
+# ----------------------------------------------------------------------
+
+
+class Concat(Operation):
+    def __init__(self, dim: int = 1):
+        self.dim = dim
+
+    def forward(self, a: GaussianTensor, b: GaussianTensor) -> GaussianTensor:
+        mu = torch.cat([a.mu, b.mu], dim=self.dim)
+        var = torch.cat([a.var, b.var], dim=self.dim)
+        out = GaussianTensor(mu, var, parents=(a, b), op=self, name="concat")
+        out._ctx["split"] = a.mu.shape[self.dim]  # size of the first operand
+        return out
+
+    def backward(self, node: GaussianTensor) -> None:
+        a, b = node.parents
+        s, d = node._ctx["split"], self.dim
+        idx_a = [slice(None)] * node.d_mu.dim()
+        idx_b = [slice(None)] * node.d_mu.dim()
+        idx_a[d] = slice(0, s)
+        idx_b[d] = slice(s, None)
+        a._accumulate(node.d_mu[tuple(idx_a)], node.d_var[tuple(idx_a)])
+        b._accumulate(node.d_mu[tuple(idx_b)], node.d_var[tuple(idx_b)])
+
+
+def concat(a: GaussianTensor, b: GaussianTensor, dim: int = 1) -> GaussianTensor:
+    """Concatenate two Gaussian tensors along ``dim`` (default: channels)."""
+    return Concat(dim).forward(a, b)
+
+
+# ----------------------------------------------------------------------
+#  Upsample:  nearest-neighbour spatial upsample by an integer factor.
+#           Each input pixel is copied to a k×k output block (Jacobian = 1),
+#           so the backward sums each block's innovation back to its pixel
+#           (the exact adjoint of the copy).
+# ----------------------------------------------------------------------
+
+
+class Upsample(Operation):
+    def __init__(self, scale: int = 2):
+        self.scale = scale
+
+    def forward(self, x: GaussianTensor) -> GaussianTensor:
+        k = self.scale
+        mu = x.mu.repeat_interleave(k, dim=2).repeat_interleave(k, dim=3)
+        var = x.var.repeat_interleave(k, dim=2).repeat_interleave(k, dim=3)
+        out = GaussianTensor(mu, var, parents=(x,), op=self, name="upsample")
+        out._ctx["shape"] = x.shape
+        return out
+
+    def backward(self, node: GaussianTensor) -> None:
+        (x,) = node.parents
+        k = self.scale
+        N, C, H, W = node._ctx["shape"]
+        dm = node.d_mu.reshape(N, C, H, k, W, k).sum(dim=(3, 5))
+        dv = node.d_var.reshape(N, C, H, k, W, k).sum(dim=(3, 5))
+        x._accumulate(dm, dv)
+
+
+def upsample(x: GaussianTensor, scale: int = 2) -> GaussianTensor:
+    """Nearest-neighbour spatial upsample by an integer ``scale`` factor."""
+    return Upsample(scale).forward(x)
+
+
+# ----------------------------------------------------------------------
 #  Activation:  A = f(Z), (mu_A, var_A, jcb) from the existing library kernel.
 #        backward (normalized): delta_mu_Z = jcb·delta_mu_A,
 #                               delta_var_Z = jcb^2·delta_var_A
@@ -917,9 +985,11 @@ class BatchNorm2D(Module):
 class _WrappedUnary(Module):
     """Base for param-free autocov ops that wrap a one-in/one-out layer.
 
-    Subclasses set ``self.name`` and ``self._layer`` in ``__init__``. Because the
-    layer caches per-forward state (pooling indices, input shape), call
-    ``observe``/backward before reusing the same instance in the graph.
+    Subclasses set ``self.name`` and ``self._layer`` in ``__init__``. The wrapped
+    layer caches per-forward state (pooling indices, input shape) on its instance,
+    so reusing one op in a graph (e.g. one pool applied at several U-Net stages)
+    would clobber it. Because these layers are parameter-free, the backward simply
+    recomputes that cache from the node's own input first — making reuse safe.
     """
 
     def forward(self, a: GaussianTensor) -> GaussianTensor:
@@ -928,6 +998,10 @@ class _WrappedUnary(Module):
 
     def backward(self, node: GaussianTensor) -> None:
         a = node.parents[0]
+        # Restore this node's per-forward cache (the op instance may be reused
+        # elsewhere in the graph, which would have overwritten it). Safe because
+        # the wrapped layer has no learnable parameters or running state.
+        self._layer.forward(a.mu, a.var)
         d_ma, d_Sa = self._layer.backward(node.d_mu, node.d_var)  # reuse existing backward
         a._accumulate(d_ma, d_Sa)
 

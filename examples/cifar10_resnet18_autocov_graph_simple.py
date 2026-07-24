@@ -78,6 +78,7 @@ class ResBlock(Module):
         s = self.proj_bn(relu(self.proj_conv(x))) if self.use_proj else x
         # Merge (residual add; variances add under the diagonal approximation)
         out = add(z, s)
+        out.print_graph()
         return out
 
 

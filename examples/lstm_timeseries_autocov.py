@@ -40,13 +40,11 @@ class LSTMRegressor(Module):
                  gain_w: float = 0.5, gain_b: float = 0.5):
         super().__init__()
         self.lstm = LSTM(1, hidden, rng=rng, device=device, gain_w=gain_w, gain_b=gain_b)
-        self.lstm1 = LSTM(hidden, hidden, rng=rng, device=device, gain_w=gain_w, gain_b=gain_b)
         self.readout = Linear(hidden, 1, rng=rng, device=device, gain_w=gain_w, gain_b=gain_b)
 
     def forward(self, seq):
         # seq: list of T tensors, each (B, 1).
-        hs = self.lstm(seq, return_sequence=True)   # layer 1: T hidden states, each (B, hidden)
-        h = self.lstm1(hs)                           # layer 2: final hidden state (B, hidden)
+        h = self.lstm(seq, return_sequence=False)   # layer 1: T hidden states, each (B, hidden)
         return self.readout(h)                       # predict from the top-layer last hidden
 
 
@@ -210,9 +208,9 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Bayesian LSTM multi-step forecasting (autocov)")
-    parser.add_argument("--n_epochs", type=int, default=300)
+    parser.add_argument("--n_epochs", type=int, default=100)
     parser.add_argument("--hidden", type=int, default=20)
-    parser.add_argument("--window", type=int, default=20)
+    parser.add_argument("--window", type=int, default=2)
     parser.add_argument("--noise_std", type=float, default=0.05)
     parser.add_argument("--sigma_v", type=float, default=0.1)
     parser.add_argument("--horizon", type=int, default=None,
