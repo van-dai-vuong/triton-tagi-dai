@@ -329,6 +329,24 @@ def _innovation(y, mu, var, var_v):
     return dmu.reshape(shape), dvar.reshape(shape)
 
 
+# The big per-forward activation caches the wrapped library layers stash for
+# their backward (im2col patches, BatchNorm normalized activations, pooling
+# indices, the flattened linear input). They are rebuilt on every forward, so
+# freeing them right after a node's backward keeps the reverse sweep's peak
+# memory low without affecting correctness. ``delta_*`` are left alone (tiny,
+# already consumed onto the aliased Parameters).
+_TRANSIENT_LAYER_ATTRS = ("patches_ma", "ma_in", "m_hat", "S_hat", "_norm_var", "pool_idx")
+
+
+def _free_layer_transients(layer) -> None:
+    """Drop a wrapped layer's per-forward activation caches (rebuilt next
+    forward) so the autocov backward sweep does not hold every layer's cache
+    at once — the main source of autocov's memory overhead over ``Sequential``."""
+    for attr in _TRANSIENT_LAYER_ATTRS:
+        if getattr(layer, attr, None) is not None:
+            setattr(layer, attr, None)
+
+
 # ======================================================================
 #  GaussianTensor — the graph node
 # ======================================================================
@@ -419,13 +437,21 @@ class GaussianTensor:
         if self.d_mu is None:
             self.d_mu = torch.zeros_like(self.mu)
             self.d_var = torch.zeros_like(self.var)
-        self.d_mu = self.d_mu + d_mu
-        self.d_var = self.d_var + d_var
+        # In-place accumulation onto the owned buffer (avoids reallocating a new
+        # innovation tensor per incoming child edge — the source is never mutated).
+        self.d_mu += d_mu
+        self.d_var += d_var
 
     # ==================================================================
     #  observe(): output-layer normalized innovation + automatic backward.
     # ==================================================================
-    def observe(self, y, var_v: float = 0.0, cap_factor: float | None = None) -> None:
+    def observe(
+        self,
+        y,
+        var_v: float = 0.0,
+        cap_factor: float | None = None,
+        free_memory: bool = True,
+    ) -> None:
         """Condition the graph on ``y = self + v``, ``v ~ N(0, var_v)``, then
         propagate the update back to every hidden state and parameter.
         Parameters are updated IN PLACE (capped, cuTAGI-style).
@@ -435,6 +461,10 @@ class GaussianTensor:
 
             delta_mu  = (y - mu) / (var + var_v)
             delta_var = -1       / (var + var_v)
+
+        ``free_memory`` (default ``True``) releases each node's moments / caches
+        during the backward sweep — see :meth:`backward`. Pass ``False`` to keep
+        the graph inspectable after conditioning (e.g. for ``print_graph``).
         """
         y = torch.as_tensor(y, dtype=self.mu.dtype).to(self.mu.device).reshape(self.mu.shape)
         if _TRACE:
@@ -445,7 +475,7 @@ class GaussianTensor:
             batch = int(self.mu.shape[0]) if self.mu.dim() >= 1 else 1
             cap_factor = get_cap_factor(batch)
         self._accumulate(delta_mu, delta_var)
-        self.backward(cap_factor)
+        self.backward(cap_factor, free_memory=free_memory)
 
     def build_topo(self) -> list["GaussianTensor"]:
         """Build the backward execution order (children before parents).
@@ -469,10 +499,26 @@ class GaussianTensor:
         self.topo = list(reversed(post))  # backward order: children before parents
         return self.topo
 
-    def backward(self, cap_factor: float = 1.0) -> None:
+    def backward(self, cap_factor: float = 1.0, free_memory: bool = True) -> None:
         """Reverse-topological sweep: chain the layer backwards, apply capped
-        parameter updates. Innovations are freed afterwards (per-forward graph)."""
-        for node in self.build_topo():  # children before parents
+        parameter updates. Innovations are freed afterwards (per-forward graph).
+
+        Memory
+        ------
+        The graph forwards in full before any backward runs, so at the start of
+        the sweep every layer's forward cache (im2col patches, BatchNorm stats,
+        pooling indices) and every node's ``(mu, var)`` are alive at once — the
+        reason autocov peaks higher than ``Sequential``. With ``free_memory``
+        (default ``True``) each node's moments / op-context and its wrapped
+        layer's transient caches are dropped the instant its backward completes,
+        so the sweep's peak and the post-sweep residual stay low. A node's
+        ``mu`` is only read by its children's backward (all processed earlier in
+        reverse-topo order), so releasing it here is safe; :class:`Parameter`
+        moments persist. Pass ``free_memory=False`` to keep the graph fully
+        inspectable (``print_graph`` / ``.mu`` / ``.var``) after the sweep.
+        """
+        topo = self.build_topo()  # children before parents
+        for node in topo:
             has_innov = node.d_mu is not None
             if node._retain and not isinstance(node, Parameter):
                 # True posterior: hidden nodes carry NORMALIZED innovation, so
@@ -481,21 +527,29 @@ class GaussianTensor:
                 dv = (node.var * node.var) * node.d_var if has_innov else 0.0
                 node.post_mu = node.mu + dm
                 node.post_var = torch.clamp(node.var + dv, min=_EPS)
-            if not has_innov:
-                continue
-            if node._op is not None:
-                if _TRACE:
-                    print(
-                        f"[CLOSURE] {node.name}._backward  IN: "
-                        f"d_mu={_fmt(node.d_mu)}, d_var={_fmt(node.d_var)}"
-                    )
-                node._op.backward(node)
-            if isinstance(node, Parameter):
-                node._apply_update(cap_factor)
-                if node._retain:
-                    node.post_mu, node.post_var = node.mu, node.var
-            # free innovations (graph is per-forward, like autograd)
-            node.d_mu = node.d_var = None
+            if has_innov:
+                if node._op is not None:
+                    if _TRACE:
+                        print(
+                            f"[CLOSURE] {node.name}._backward  IN: "
+                            f"d_mu={_fmt(node.d_mu)}, d_var={_fmt(node.d_var)}"
+                        )
+                    node._op.backward(node)
+                if isinstance(node, Parameter):
+                    node._apply_update(cap_factor)
+                    if node._retain:
+                        node.post_mu, node.post_var = node.mu, node.var
+                # free innovations (graph is per-forward, like autograd)
+                node.d_mu = node.d_var = None
+            # Eager release: drop this node's cached moments / op-context now
+            # that its backward has run. Parameters keep their (mu, var).
+            if free_memory:
+                node._ctx = {}
+                if not isinstance(node, Parameter):
+                    node.mu = None
+                    node.var = None
+        if free_memory:
+            self.topo = []
 
     # ==================================================================
     #  Debugging: visualise the backward graph
@@ -1051,6 +1105,7 @@ class Linear(Module):
         self.W._accumulate(self._layer.delta_mw, self._layer.delta_Sw)
         if self.has_bias:
             self.b._accumulate(self._layer.delta_mb, self._layer.delta_Sb)
+        _free_layer_transients(self._layer)  # drop cached input (rebuilt next forward)
 
     def __repr__(self):
         return f"Linear(in={self.in_features}, out={self.out_features}, bias={self.has_bias})"
@@ -1122,6 +1177,7 @@ class Conv2D(Module):
         # the sweep then applies the capped update in place (layer tensors too).
         self.W._accumulate(self._layer.delta_mw, self._layer.delta_Sw)
         self.b._accumulate(self._layer.delta_mb, self._layer.delta_Sb)
+        _free_layer_transients(self._layer)  # drop im2col patches (the big cache)
 
     def __repr__(self):
         L = self._layer
@@ -1190,6 +1246,7 @@ class BatchNorm2D(Module):
         a._accumulate(d_mz, d_Sz)
         self.W._accumulate(self._layer.delta_mw, self._layer.delta_Sw)
         self.b._accumulate(self._layer.delta_mb, self._layer.delta_Sb)
+        _free_layer_transients(self._layer)  # drop normalized-activation caches
 
     def train(self, mode: bool = True) -> "Module":
         self._layer.train() if mode else self._layer.eval()
@@ -1234,6 +1291,7 @@ class _WrappedUnary(Module):
         self._layer.forward(a.mu, a.var)
         d_ma, d_Sa = self._layer.backward(node.d_mu, node.d_var)  # reuse existing backward
         a._accumulate(d_ma, d_Sa)
+        _free_layer_transients(self._layer)  # drop pooling indices / cached input
 
     def __repr__(self):
         return repr(self._layer)
