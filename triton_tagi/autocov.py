@@ -145,6 +145,32 @@ def get_default_device() -> torch.device:
     return _DEFAULT_DEVICE
 
 
+# ----------------------------------------------------------------------
+#  Activation checkpointing (memory vs. compute trade-off)
+# ----------------------------------------------------------------------
+#  autocov forwards the whole graph before any backward runs, so without help
+#  every Conv2D's im2col patch matrix — each ``kernel²`` times larger than its
+#  input — stays cached until backward, and all of them coexist at the forward
+#  peak (the dominant cost in a deep ResNet / U-Net). With checkpointing on
+#  (default), Conv2D drops its patch cache right after forward and rebuilds it
+#  by re-running its (side-effect-free) forward at backward time — trading ~one
+#  extra im2col per conv for a large drop in peak memory. Turn off with
+#  :func:`set_checkpoint` if you have memory to spare and want the speed.
+
+_CHECKPOINT = True
+
+
+def set_checkpoint(enabled: bool = True) -> None:
+    """Enable/disable conv activation checkpointing (default enabled)."""
+    global _CHECKPOINT
+    _CHECKPOINT = enabled
+
+
+def get_checkpoint() -> bool:
+    """Return whether conv activation checkpointing is enabled."""
+    return _CHECKPOINT
+
+
 # ======================================================================
 #  Triton element-wise kernels — the Gaussian moment math
 # ======================================================================
@@ -953,12 +979,15 @@ class Activation(Operation):
     def forward(self, z: GaussianTensor) -> GaussianTensor:
         mu_a, var_a, jcb = self.fn(z.mu, z.var)
         out = GaussianTensor(mu_a, var_a, parents=(z,), op=self, name=self.name)
-        out._ctx["jcb"] = jcb
+        if not _CHECKPOINT:
+            out._ctx["jcb"] = jcb  # else recompute in backward from z's moments
         return out
 
     def backward(self, node: GaussianTensor) -> None:
         (z,) = node.parents
-        jcb = node._ctx["jcb"]
+        jcb = node._ctx.get("jcb")
+        if jcb is None:  # checkpointed: recompute the (pure) activation Jacobian
+            _, _, jcb = self.fn(z.mu, z.var)
         # delta_mu_Z = jcb·delta_mu_A, delta_var_Z = jcb²·delta_var_A (Triton).
         d_mu, d_var = _scale_delta(jcb, node.d_mu, node.d_var)
         z._accumulate(d_mu, d_var)
@@ -1166,10 +1195,19 @@ class Conv2D(Module):
 
     def forward(self, a: GaussianTensor) -> GaussianTensor:
         mz, Sz = self._layer.forward(a.mu, a.var)  # reuse existing forward
-        return GaussianTensor(mz, Sz, parents=(a, self.W, self.b), op=self, name=self.name)
+        out = GaussianTensor(mz, Sz, parents=(a, self.W, self.b), op=self, name=self.name)
+        if _CHECKPOINT:
+            # Drop the (kernel²-expanded) im2col patches now; rebuilt in backward.
+            self._layer.patches_ma = None
+        return out
 
     def backward(self, node: GaussianTensor) -> None:
         a = node.parents[0]
+        # Checkpointing: if the patch cache was dropped after forward, rebuild it
+        # by re-running the (pure) conv forward from this node's own input. Only
+        # the current conv's patches are ever materialised at once during the sweep.
+        if self._layer.patches_ma is None:
+            self._layer.forward(a.mu, a.var)
         # Reuse existing backward: returns input deltas, stores the param deltas.
         d_ma, d_Sa = self._layer.backward(node.d_mu, node.d_var)
         a._accumulate(d_ma, d_Sa)
